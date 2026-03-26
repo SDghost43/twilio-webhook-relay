@@ -20,9 +20,23 @@ app.post('/webhook', async (req, res) => {
 
   console.log(`Received SMS from ${smsFrom}: ${smsBody}`);
 
-  // Only process messages from Dad's number
-  if (smsFrom !== DAD_NUMBER) {
+  // Log all incoming messages for debugging
+  console.log(`DAD_NUMBER configured as: ${DAD_NUMBER}`);
+  console.log(`Message from: ${smsFrom}`);
+
+  // Only process messages from Dad's number (or any number if DAD_NUMBER not set)
+  if (DAD_NUMBER && smsFrom !== DAD_NUMBER) {
     console.log('Message from unknown number, ignoring.');
+    // Still forward to Discord for debugging
+    if (DISCORD_WEBHOOK_URL) {
+      await fetch(DISCORD_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: `⚠️ **SMS received from unknown number** (${smsFrom}):\n> ${smsBody}\n*(Not forwarded — not Dad's number)*`
+        })
+      });
+    }
     return res.send('<Response></Response>');
   }
 
