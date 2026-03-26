@@ -6,13 +6,17 @@ const fetch = require('node-fetch');
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;   // Starts with AC
+const TWILIO_API_KEY = process.env.TWILIO_API_KEY;             // Starts with SK
+const TWILIO_API_SECRET = process.env.TWILIO_API_SECRET;       // The secret/token
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
 const DAD_NUMBER = process.env.DAD_NUMBER;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+// Support both auth methods: API Key (SK) or Auth Token (AC)
+const twilioClient = TWILIO_API_KEY
+  ? twilio(TWILIO_API_KEY, TWILIO_API_SECRET, { accountSid: TWILIO_ACCOUNT_SID })
+  : twilio(TWILIO_ACCOUNT_SID, TWILIO_API_SECRET);
 
 app.post('/webhook', async (req, res) => {
   const smsFrom = req.body.From;
