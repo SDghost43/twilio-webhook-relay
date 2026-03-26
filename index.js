@@ -24,8 +24,12 @@ app.post('/webhook', async (req, res) => {
   console.log(`DAD_NUMBER configured as: ${DAD_NUMBER}`);
   console.log(`Message from: ${smsFrom}`);
 
-  // Only process messages from Dad's number (or any number if DAD_NUMBER not set)
-  if (DAD_NUMBER && smsFrom !== DAD_NUMBER) {
+  // Allowed numbers: Dad's number + optional test number
+  const TEST_NUMBER = process.env.TEST_NUMBER;
+  const allowedNumbers = [DAD_NUMBER, TEST_NUMBER].filter(Boolean);
+
+  // Only process messages from allowed numbers
+  if (allowedNumbers.length > 0 && !allowedNumbers.includes(smsFrom)) {
     console.log('Message from unknown number, ignoring.');
     // Still forward to Discord for debugging
     if (DISCORD_WEBHOOK_URL) {
