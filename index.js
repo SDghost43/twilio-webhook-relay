@@ -114,8 +114,11 @@ app.post('/webhook', async (req, res) => {
   console.log(`SMS from ${smsFrom}: ${smsBody}`);
   res.send('<Response></Response>');
 
-  const isFromDad = smsFrom === DAD_NUMBER;
+  const TEST_NUMBER = process.env.TEST_NUMBER;
+  const isFromDad = smsFrom === DAD_NUMBER || smsFrom === TEST_NUMBER;
   const isFromJames = smsFrom === JAMES_NUMBER;
+
+  console.log(`DAD_NUMBER="${DAD_NUMBER}" JAMES_NUMBER="${JAMES_NUMBER}" FROM="${smsFrom}" isFromDad=${isFromDad} isFromJames=${isFromJames}`);
 
   // ── JAMES confirming/cancelling ──
   if (isFromJames) {
