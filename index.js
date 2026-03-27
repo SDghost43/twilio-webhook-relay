@@ -121,7 +121,9 @@ app.post('/webhook', async (req, res) => {
   console.log(`DAD_NUMBER="${DAD_NUMBER}" JAMES_NUMBER="${JAMES_NUMBER}" FROM="${smsFrom}" isFromDad=${isFromDad} isFromJames=${isFromJames}`);
 
   // ── JAMES confirming/cancelling ──
-  if (isFromJames) {
+  // If number matches both (testing), route to James only when there's a pending order to approve
+  const hasPendingOrder = conversations.has('james_pending');
+  if (isFromJames && (!isFromDad || hasPendingOrder)) {
     if (isConfirmation(smsBody) && conversations.get('james_pending')) {
       const order = conversations.get('james_pending');
       conversations.delete('james_pending');
