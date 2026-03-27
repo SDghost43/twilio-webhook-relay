@@ -1,36 +1,34 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const twilio = require('twilio');
-const fetch = require('node-fetch');
+const { RestClient } = require('@signalwire/compatibility-api');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
+const SW_PROJECT_ID = process.env.SW_PROJECT_ID;
+const SW_API_TOKEN = process.env.SW_API_TOKEN;
+const SW_SPACE_URL = process.env.SW_SPACE_URL;
+const FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
 const DAD_NUMBER = process.env.DAD_NUMBER;
 const JAMES_NUMBER = process.env.JAMES_NUMBER;
+const TEST_NUMBER = process.env.TEST_NUMBER;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const DAD_ADDRESS = process.env.DAD_ADDRESS || '2713 Emerald Ct., Atwater, CA 95301';
 const LAUNCHER_SECRET = process.env.LAUNCHER_SECRET || 'doordash-secret';
 
-const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+const swClient = RestClient(SW_PROJECT_ID, SW_API_TOKEN, { signalwireSpaceUrl: SW_SPACE_URL });
 
 // In-memory state
-const conversations = new Map(); // phone -> { state, order, restaurant, address }
-let pendingOrder = null; // Order waiting for launcher to pick up
+const conversations = new Map();
+let pendingOrder = null;
 
-// States
 const STATE = {
   IDLE: 'idle',
   AWAITING_ITEM_CONFIRM: 'awaiting_item_confirm',
   AWAITING_JAMES_CONFIRM: 'awaiting_james_confirm',
-  CONFIRMED: 'confirmed'
 };
 
-// Simple menu suggestions
 const menuMap = {
   'hamburger': 'Big Mac Meal (Large)',
   'burger': 'Big Mac Meal (Large)',
@@ -59,9 +57,7 @@ function parseOrder(text) {
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    if (match) {
-      return { item: match[1].trim(), restaurant: match[2].trim() };
-    }
+    if (match) return { item: match[1].trim(), restaurant: match[2].trim() };
   }
   return { item: text.trim(), restaurant: null };
 }
@@ -76,37 +72,26 @@ function isCancellation(text) {
 
 async function sendSMS(to, message) {
   try {
-    await twilioClient.messages.create({
-      body: message,
-      from: TWILIO_FROM_NUMBER,
-      to: to
-    });
+    await swClient.messages.create({ body: message, from: FROM_NUMBER, to });
+    console.log(`SMS sent to ${to}`);
   } catch (err) {
     console.error('SMS send error:', err.message);
   }
 }
 
-async function notifyDiscord(order) {
+async function notifyDiscord(content) {
   if (!DISCORD_WEBHOOK_URL) return;
-  await fetch(DISCORD_WEBHOOK_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      content: [
-        `📦 **NEW ORDER FROM DAD**`,
-        `👤 From: ${DAD_NUMBER}`,
-        `🏪 Restaurant: **${order.restaurant}**`,
-        `🍔 Item: **${order.item}**`,
-        `📍 Deliver to: **${order.address}**`,
-        ``,
-        `✅ Reply CONFIRM to Twilio (${TWILIO_FROM_NUMBER}) to place order`,
-        `❌ Reply CANCEL to reject`
-      ].join('\n')
-    })
-  });
+  try {
+    await fetch(DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content })
+    });
+  } catch (err) {
+    console.error('Discord notify error:', err.message);
+  }
 }
 
-// Main SMS webhook
 app.post('/webhook', async (req, res) => {
   const smsFrom = req.body.From;
   const smsBody = (req.body.Body || '').trim();
@@ -114,134 +99,97 @@ app.post('/webhook', async (req, res) => {
   console.log(`SMS from ${smsFrom}: ${smsBody}`);
   res.send('<Response></Response>');
 
-  const TEST_NUMBER = process.env.TEST_NUMBER;
   const isFromDad = smsFrom === DAD_NUMBER || smsFrom === TEST_NUMBER;
   const isFromJames = smsFrom === JAMES_NUMBER;
-
-  console.log(`DAD_NUMBER="${DAD_NUMBER}" JAMES_NUMBER="${JAMES_NUMBER}" FROM="${smsFrom}" isFromDad=${isFromDad} isFromJames=${isFromJames}`);
-
-  // ── JAMES confirming/cancelling ──
-  // If number matches both (testing), route to James only when there's a pending order to approve
   const hasPendingOrder = conversations.has('james_pending');
+
+  console.log(`isFromDad=${isFromDad} isFromJames=${isFromJames} hasPendingOrder=${hasPendingOrder}`);
+
+  // James approval flow (only when pending order exists or not also dad)
   if (isFromJames && (!isFromDad || hasPendingOrder)) {
-    if (isConfirmation(smsBody) && conversations.get('james_pending')) {
+    if (isConfirmation(smsBody) && hasPendingOrder) {
       const order = conversations.get('james_pending');
       conversations.delete('james_pending');
-
-      // Set pending order for laptop to pick up
       pendingOrder = { ...order, confirmedAt: Date.now() };
 
       await sendSMS(JAMES_NUMBER, `✅ Got it! Opening DoorDash on your laptop now...`);
       await sendSMS(DAD_NUMBER, `Great news! Your order is being placed now. 🍔 Estimated arrival: 35-45 mins. Enjoy!`);
+      await notifyDiscord(`✅ **Order confirmed by James!** Opening DoorDash now...\n🏪 ${order.restaurant} — ${order.item}\n📍 ${order.address}`);
 
-      // Notify Discord
-      if (DISCORD_WEBHOOK_URL) {
-        await fetch(DISCORD_WEBHOOK_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            content: `✅ **Order confirmed by James!** Opening DoorDash now...\n🏪 ${order.restaurant} — ${order.item}\n📍 ${order.address}`
-          })
-        });
-      }
-
-    } else if (isCancellation(smsBody) && conversations.get('james_pending')) {
+    } else if (isCancellation(smsBody) && hasPendingOrder) {
       conversations.delete('james_pending');
       await sendSMS(JAMES_NUMBER, `❌ Order cancelled.`);
-      await sendSMS(DAD_NUMBER, `Hey! We had a small issue with your order. Please try texting again or call James. Sorry about that!`);
+      await sendSMS(DAD_NUMBER, `Hey! We had a small issue with your order. Please try again or call James. Sorry!`);
     } else {
-      console.log(`James said: ${smsBody} — no pending order or unrecognized`);
+      console.log(`James: no pending order or unrecognized message`);
     }
     return;
   }
 
-  // ── DAD's conversation ──
   if (!isFromDad) {
     console.log(`Unknown number ${smsFrom}, ignoring`);
     return;
   }
 
+  // Dad's conversation flow
   const conv = conversations.get(DAD_NUMBER) || { state: STATE.IDLE };
 
   if (conv.state === STATE.AWAITING_ITEM_CONFIRM) {
     if (isConfirmation(smsBody)) {
-      // Dad confirmed the order
       const order = conv.order;
       conversations.set(DAD_NUMBER, { state: STATE.AWAITING_JAMES_CONFIRM, order });
-
-      // Store for James
       conversations.set('james_pending', order);
 
       await sendSMS(DAD_NUMBER, `Perfect! I'm sending it to James for approval. You'll get a text once it's placed! 🍔`);
       await sendSMS(JAMES_NUMBER,
-        `📦 Dad's DoorDash Order:\n` +
-        `🏪 ${order.restaurant}\n` +
-        `🍔 ${order.item}\n` +
-        `📍 ${order.address}\n\n` +
-        `Reply CONFIRM to place or CANCEL to reject.`
+        `📦 Dad's DoorDash Order:\n🏪 ${order.restaurant}\n🍔 ${order.item}\n📍 ${order.address}\n\nReply CONFIRM to place or CANCEL to reject.`
       );
-      await notifyDiscord(order);
+      await notifyDiscord(
+        `📦 **NEW ORDER FROM DAD**\n👤 From: ${DAD_NUMBER}\n🏪 Restaurant: **${order.restaurant}**\n🍔 Item: **${order.item}**\n📍 Deliver to: **${order.address}**\n\nWaiting for James to reply CONFIRM/CANCEL via SMS.`
+      );
 
     } else if (isCancellation(smsBody)) {
       conversations.set(DAD_NUMBER, { state: STATE.IDLE });
-      await sendSMS(DAD_NUMBER, `No problem! Order cancelled. Text me anytime you want to order food! 😊`);
+      await sendSMS(DAD_NUMBER, `No problem! Order cancelled. Text me anytime! 😊`);
 
     } else {
-      // Dad is changing/clarifying the order
       const { item, restaurant } = parseOrder(smsBody);
-      const suggestion = suggestItem(item);
-      const finalItem = suggestion || item;
+      const finalItem = suggestItem(item) || item;
       const finalRestaurant = restaurant || conv.order.restaurant;
       const order = { item: finalItem, restaurant: finalRestaurant, address: DAD_ADDRESS };
-
       conversations.set(DAD_NUMBER, { state: STATE.AWAITING_ITEM_CONFIRM, order });
       await sendSMS(DAD_NUMBER,
-        `Got it! So you want:\n` +
-        `🍔 ${finalItem}\n` +
-        `🏪 from ${finalRestaurant}\n` +
-        `📍 to ${DAD_ADDRESS}\n\n` +
-        `Does that sound right? (Yes/No)`
+        `Got it! So you want:\n🍔 ${finalItem}\n🏪 from ${finalRestaurant}\n📍 to ${DAD_ADDRESS}\n\nDoes that sound right? (Yes/No)`
       );
     }
     return;
   }
 
-  // New order (idle state)
+  // New order
   const { item, restaurant } = parseOrder(smsBody);
-
   if (!restaurant) {
-    await sendSMS(DAD_NUMBER, `Hey! What restaurant do you want to order from? For example: "I want a burger from McDonald's"`);
+    await sendSMS(DAD_NUMBER, `Hey! What restaurant do you want? Example: "I want a burger from McDonald's"`);
     return;
   }
 
-  const suggestion = suggestItem(item);
-  const finalItem = suggestion || item;
+  const finalItem = suggestItem(item) || item;
   const order = { item: finalItem, restaurant, address: DAD_ADDRESS };
-
   conversations.set(DAD_NUMBER, { state: STATE.AWAITING_ITEM_CONFIRM, order });
 
   await sendSMS(DAD_NUMBER,
-    `Hey! Got your order 😊\n` +
-    `🍔 ${finalItem}\n` +
-    `🏪 from ${restaurant}\n` +
-    `📍 to ${DAD_ADDRESS}\n\n` +
-    `Does that sound right? Reply YES to confirm or tell me what to change.`
+    `Hey! Got your order 😊\n🍔 ${finalItem}\n🏪 from ${restaurant}\n📍 to ${DAD_ADDRESS}\n\nDoes that sound right? Reply YES to confirm or tell me what to change.`
   );
 });
 
-// ── Laptop polling endpoint ──
+// Laptop polling endpoint
 app.get('/api/pending-order', (req, res) => {
   const secret = req.headers['x-launcher-secret'] || req.query.secret;
-  if (secret !== LAUNCHER_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
+  if (secret !== LAUNCHER_SECRET) return res.status(401).json({ error: 'Unauthorized' });
   if (pendingOrder) {
     const order = pendingOrder;
-    pendingOrder = null; // Clear after pickup
+    pendingOrder = null;
     return res.json({ order });
   }
-
   res.json({ order: null });
 });
 

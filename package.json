@@ -8,7 +8,6 @@
   "dependencies": {
     "express": "^4.17.1",
     "body-parser": "^1.19.0",
-    "twilio": "^4.0.0",
-    "node-fetch": "^2.6.7"
+    "@signalwire/compatibility-api": "^3.0.0"
   }
 }
