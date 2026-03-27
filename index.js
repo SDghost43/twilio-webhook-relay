@@ -1,6 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const { RestClient } = require('@signalwire/compatibility-api');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -17,7 +17,7 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const DAD_ADDRESS = process.env.DAD_ADDRESS || '2713 Emerald Ct., Atwater, CA 95301';
 const LAUNCHER_SECRET = process.env.LAUNCHER_SECRET || 'doordash-secret';
 
-const swClient = RestClient(SW_PROJECT_ID, SW_API_TOKEN, { signalwireSpaceUrl: SW_SPACE_URL });
+// Use direct HTTPS instead of the SDK — avoids trial verification check bug
 
 // In-memory state
 const conversations = new Map();
@@ -72,8 +72,23 @@ function isCancellation(text) {
 
 async function sendSMS(to, message) {
   try {
-    await swClient.messages.create({ body: message, from: FROM_NUMBER, to });
-    console.log(`SMS sent to ${to}`);
+    const url = `https://${SW_SPACE_URL}/api/laml/2010-04-01/Accounts/${SW_PROJECT_ID}/Messages.json`;
+    const auth = Buffer.from(`${SW_PROJECT_ID}:${SW_API_TOKEN}`).toString('base64');
+    const params = new URLSearchParams({ From: FROM_NUMBER, To: to, Body: message });
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: params.toString()
+    });
+    const data = await resp.json();
+    if (data.error_code) {
+      console.error(`SMS send error: ${data.error_message} (code ${data.error_code})`);
+    } else {
+      console.log(`SMS sent to ${to} — status: ${data.status}`);
+    }
   } catch (err) {
     console.error('SMS send error:', err.message);
   }
