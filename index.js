@@ -12,6 +12,7 @@ const SW_SPACE_URL = process.env.SW_SPACE_URL;
 const FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
 const DAD_NUMBER = process.env.DAD_NUMBER;
 const JAMES_NUMBER = process.env.JAMES_NUMBER;
+const SISTER_NUMBER = process.env.SISTER_NUMBER; // co-approver — either James or sister can confirm
 const TEST_NUMBER = process.env.TEST_NUMBER;
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true'; // When true, all SMS go to James instead of dad
 
@@ -126,24 +127,34 @@ app.post('/webhook', async (req, res) => {
 
   const isFromDad = smsFrom === DAD_NUMBER || smsFrom === TEST_NUMBER;
   const isFromJames = smsFrom === JAMES_NUMBER;
+  const isFromSister = SISTER_NUMBER && smsFrom === SISTER_NUMBER;
+  const isApprover = isFromJames || isFromSister; // either can approve/cancel
   const hasPendingOrder = conversations.has('james_pending');
 
-  console.log(`isFromDad=${isFromDad} isFromJames=${isFromJames} hasPendingOrder=${hasPendingOrder}`);
+  console.log(`isFromDad=${isFromDad} isFromJames=${isFromJames} isFromSister=${isFromSister} hasPendingOrder=${hasPendingOrder}`);
 
-  // James approval flow (only when pending order exists or not also dad)
-  if (isFromJames && (!isFromDad || hasPendingOrder)) {
+  // Approver flow — James or sister can confirm/cancel
+  if (isApprover && (!isFromDad || hasPendingOrder)) {
     if (isConfirmation(smsBody) && hasPendingOrder) {
       const order = conversations.get('james_pending');
       conversations.delete('james_pending');
       pendingOrder = { ...order, confirmedAt: Date.now() };
+      const approverName = isFromSister ? 'your sister' : 'James';
 
-      await sendSMS(JAMES_NUMBER, `✅ Got it! Opening DoorDash on your laptop now...`);
+      await sendSMS(JAMES_NUMBER, `✅ Order confirmed by ${approverName}! Opening DoorDash on the laptop now...`);
+      if (SISTER_NUMBER && SISTER_NUMBER !== JAMES_NUMBER) {
+        await sendSMS(SISTER_NUMBER, `✅ Order confirmed! DoorDash is being placed now.`);
+      }
       await sendSMS(smsTo(DAD_NUMBER), `Great news! Your order is being placed now. 🍔 Estimated arrival: 35-45 mins. Enjoy!`);
-      await notifyDiscord(`✅ **Order confirmed by James!** Opening DoorDash now...\n🏪 ${order.restaurant} — ${order.item}\n📍 ${order.address}`);
+      await notifyDiscord(`✅ **Order confirmed by ${approverName}!** Opening DoorDash now...\n🏪 ${order.restaurant} — ${order.item}\n📍 ${order.address}`);
 
     } else if (isCancellation(smsBody) && hasPendingOrder) {
       conversations.delete('james_pending');
+      const approverName = isFromSister ? 'your sister' : 'James';
       await sendSMS(JAMES_NUMBER, `❌ Order cancelled.`);
+      if (SISTER_NUMBER && SISTER_NUMBER !== JAMES_NUMBER) {
+        await sendSMS(SISTER_NUMBER, `❌ Order cancelled.`);
+      }
       await sendSMS(smsTo(DAD_NUMBER), `Hey! We had a small issue with your order. Please try again or call James. Sorry!`);
     } else {
       console.log(`James: no pending order or unrecognized message`);
@@ -165,12 +176,15 @@ app.post('/webhook', async (req, res) => {
       conversations.set(DAD_NUMBER, { state: STATE.AWAITING_JAMES_CONFIRM, order });
       conversations.set('james_pending', order);
 
-      await sendSMS(smsTo(DAD_NUMBER), `Perfect! I'm sending it to James for approval. You'll get a text once it's placed! 🍔`);
-      await sendSMS(JAMES_NUMBER,
-        `📦 Dad's DoorDash Order:\n🏪 ${order.restaurant}\n🍔 ${order.item}\n📍 ${order.address}\n\nReply CONFIRM to place or CANCEL to reject.`
-      );
+      const approvers = SISTER_NUMBER ? 'James or your sister' : 'James';
+      await sendSMS(smsTo(DAD_NUMBER), `Perfect! I'm sending it to ${approvers} for approval. You'll get a text once it's placed! 🍔`);
+      const approvalMsg = `📦 Dad's DoorDash Order:\n🏪 ${order.restaurant}\n🍔 ${order.item}\n📍 ${order.address}\n\nReply CONFIRM to place or CANCEL to reject.`;
+      await sendSMS(JAMES_NUMBER, approvalMsg);
+      if (SISTER_NUMBER && SISTER_NUMBER !== JAMES_NUMBER) {
+        await sendSMS(SISTER_NUMBER, approvalMsg);
+      }
       await notifyDiscord(
-        `📦 **NEW ORDER FROM DAD**\n👤 From: ${DAD_NUMBER}\n🏪 Restaurant: **${order.restaurant}**\n🍔 Item: **${order.item}**\n📍 Deliver to: **${order.address}**\n\nWaiting for James to reply CONFIRM/CANCEL via SMS.`
+        `📦 **NEW ORDER FROM DAD**\n👤 From: ${DAD_NUMBER}\n🏪 Restaurant: **${order.restaurant}**\n🍔 Item: **${order.item}**\n📍 Deliver to: **${order.address}**\n\nWaiting for James or sister to reply CONFIRM/CANCEL via SMS.`
       );
 
     } else if (isCancellation(smsBody)) {
