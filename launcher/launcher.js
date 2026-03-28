@@ -231,12 +231,17 @@ async function placeOrder(order) {
 
   const browser = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
-    viewport: null,
-    screen: { width: 1600, height: 1000 },
+    viewport: { width: 1440, height: 900 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    locale: 'en-US',
+    timezoneId: 'America/Los_Angeles',
     args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--start-maximized'],
   });
   const page = browser.pages()[0] || await browser.newPage();
-  await page.setViewportSize({ width: 1600, height: 1000 }).catch(() => {});
+  // Mask webdriver detection
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  }).catch(() => {});
 
   try {
     console.log('  → Opening DoorDash...');
@@ -273,43 +278,68 @@ async function placeOrder(order) {
     if (!storeLink) throw new Error(`Could not find ${restaurantName} in search results`);
     const href = await storeLink.getAttribute('href');
     if (!href) throw new Error(`Found ${restaurantName} result but could not read its link`);
-    const storeUrl = href.startsWith('http') ? href : `https://www.doordash.com${href}`;
-    console.log(`  → Opening store directly: ${storeUrl}`);
-    await page.goto(storeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
-    console.log(`  → Opened ${restaurantName}`);
-
-    // Trigger lazy loading by scrolling down and back up
-    console.log('  → Triggering lazy load...');
-    for (let i = 0; i < 6; i++) {
-      await page.mouse.wheel(0, 800).catch(() => {});
-      await page.waitForTimeout(600);
+    // Strip cursor/junk params — stale cursor causes DoorDash to not load menu
+    const rawUrl = href.startsWith('http') ? href : `https://www.doordash.com${href}`;
+    let storeUrl;
+    try {
+      const u = new URL(rawUrl);
+      u.searchParams.delete('cursor');
+      u.searchParams.delete('pi');
+      // Keep pickup=false so it stays in delivery mode
+      storeUrl = u.toString();
+    } catch {
+      storeUrl = rawUrl;
     }
-    await page.mouse.wheel(0, -9999).catch(() => {});
-    await page.waitForTimeout(1000);
 
-    // Wait for at least one menu item to appear
-    await page.waitForSelector(
-      '[data-anchor-id="MenuItem"], [data-testid="menuItem"], [data-anchor-id="MenuItemButton"]',
-      { timeout: 10000, state: 'visible' }
-    ).catch(() => console.log('  ⚠️  Standard menu selectors not found, will do broad scan'));
-
-    // Diagnostic: print all data-anchor-id values to find real menu selectors
-    const anchorIds = await page.evaluate(() => {
-      const els = document.querySelectorAll('[data-anchor-id]');
-      const ids = new Set();
-      els.forEach(el => ids.add(el.getAttribute('data-anchor-id')));
-      return [...ids].sort();
+    // Log all menu/store API responses so we can see if data is fetching
+    page.on('response', resp => {
+      const url = resp.url();
+      if (/store|menu|item/i.test(url) && !/analytics|segment|sentry|cdn|image|font/i.test(url)) {
+        console.log(`  → API ${resp.status()} ${url.substring(0, 120)}`);
+      }
     });
-    if (anchorIds.length) {
-      console.log(`  → data-anchor-ids on page: ${anchorIds.slice(0, 30).join(', ')}`);
+
+    console.log(`  → Opening store: ${storeUrl}`);
+    await page.goto(storeUrl, { waitUntil: 'load', timeout: 60000 });
+
+    // Wait for networkidle briefly
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    // Scroll to trigger intersection-observer lazy sections
+    console.log('  → Scrolling to trigger lazy content...');
+    for (let i = 0; i < 10; i++) {
+      await page.mouse.wheel(0, 900).catch(() => {});
+      await page.waitForTimeout(500);
     }
-
-    // Also extract some visible text to confirm content loaded
-    const pageText = await page.evaluate(() => document.body.innerText.substring(0, 800));
-    console.log(`  → Page text sample: ${pageText.replace(/\s+/g, ' ').substring(0, 300)}`);
-
+    await page.mouse.wheel(0, -99999).catch(() => {});
     await page.waitForTimeout(1000);
+
+    // Wait for visible menu content
+    const menuSelectors = [
+      '[data-anchor-id*="MenuItem"]',
+      'button:has-text("Add to cart")',
+      'h2:has-text("Most Ordered")',
+      'h2:has-text("Featured Items")',
+      'h2:has-text("Burgers")',
+      'h2:has-text("Meals")',
+      'h2:has-text("Combo")',
+    ];
+    let foundMenuSelector = null;
+    for (const sel of menuSelectors) {
+      try {
+        await page.locator(sel).first().waitFor({ state: 'visible', timeout: 3000 });
+        foundMenuSelector = sel;
+        console.log(`  → Menu visible via: ${sel}`);
+        break;
+      } catch {}
+    }
+    if (!foundMenuSelector) console.log('  ⚠️  No menu selector matched, doing broad text scan');
+
+    // Quick text sample
+    const pageText = await page.evaluate(() => document.body.innerText.substring(0, 600));
+    const textSample = pageText.replace(/\s+/g, ' ').substring(0, 250);
+    console.log(`  → Page text: ${textSample}`);
 
     console.log(`  → Looking for item: ${order.item}`);
     const match = await findMenuItem(page, restaurantName, order.item);
