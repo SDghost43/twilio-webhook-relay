@@ -106,15 +106,21 @@ async function placeOrder(order) {
     });
     await page.waitForTimeout(2000);
 
-    // Click first restaurant result
-    const storeLink = await page.$('[data-anchor-id="StoreListItem"]') ||
-                      await page.$('[data-testid="store-cell"]') ||
-                      await page.$('a[href*="/store/"]');
+    // Open first restaurant result by href instead of clicking (DoorDash overlays intercept clicks)
+    const storeLink = await page.$('a[data-anchor-id="StoreCard"], [data-anchor-id="StoreListItem"] a[href*="/store/"], a[href*="/store/"]');
 
     if (!storeLink) {
       throw new Error(`Could not find ${restaurantName} in search results`);
     }
-    await storeLink.click();
+
+    const href = await storeLink.getAttribute('href');
+    if (!href) {
+      throw new Error(`Found ${restaurantName} result but could not read its link`);
+    }
+
+    const storeUrl = href.startsWith('http') ? href : `https://www.doordash.com${href}`;
+    console.log(`  → Opening store directly: ${storeUrl}`);
+    await page.goto(storeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
     console.log(`  → Opened ${restaurantName}`);
 
