@@ -94,45 +94,35 @@ function scoreCandidate(requestedItem, candidateText) {
 }
 
 async function collectTextCandidates(page) {
-  // DoorDash doesn't use data-anchor-id on menu items — extract via page text + elements
+  // DoorDash doesn't use data-anchor-id on menu items.
+  // textContent smashes child text together (e.g. "Big Mac®$8.29Last ordered 12/16")
+  // We use innerText split by newlines and take first line of each element to get clean item names.
   const results = await page.evaluate(() => {
     const items = [];
     const seen = new Set();
-    // Walk all leaf-ish elements
-    const els = document.querySelectorAll('span, p, h1, h2, h3, h4, button, a, div[role="button"]');
+    const els = document.querySelectorAll('span, p, h1, h2, h3, h4, button, a, li, div');
     for (const el of els) {
-      const t = (el.textContent || '').trim();
-      if (!t || t.length < 4 || t.length > 120) continue;
-      if (seen.has(t)) continue;
-      seen.add(t);
-      // Get a clickable ancestor
-      let clickable = el;
-      let parent = el.parentElement;
-      for (let i = 0; i < 5 && parent; i++) {
-        if (parent.tagName === 'A' || parent.tagName === 'BUTTON' ||
-            parent.getAttribute('role') === 'button' ||
-            parent.onclick) {
-          clickable = parent;
-          break;
-        }
-        parent = parent.parentElement;
-      }
-      items.push({ text: t, tag: clickable.tagName, selector: null });
+      const raw = (el.innerText || '').trim();
+      if (!raw) continue;
+      // Take only the first non-empty line — avoids price/date contamination
+      const firstLine = raw.split('\n').map(l => l.trim()).find(l => l.length > 2) || '';
+      if (!firstLine || firstLine.length < 4 || firstLine.length > 100) continue;
+      if (seen.has(firstLine)) continue;
+      seen.add(firstLine);
+      items.push(firstLine);
     }
     return items;
   });
 
-  // Now get actual handles for the menu-relevant items
   const out = [];
   const seen = new Set();
-  for (const item of results) {
-    const norm = normalizeText(item.text);
+  for (const raw of results) {
+    const norm = normalizeText(raw);
     if (!norm || norm.length < 4 || norm.length > 80) continue;
     if (seen.has(norm)) continue;
     seen.add(norm);
-    // Find clickable handle by exact text match
-    const handle = await page.locator(`text="${item.text}"`).first().elementHandle().catch(() => null);
-    if (handle) out.push({ handle, text: norm, raw: item.text });
+    const handle = await page.locator(`text="${raw}"`).first().elementHandle().catch(() => null);
+    if (handle) out.push({ handle, text: norm, raw });
   }
   return out;
 }
