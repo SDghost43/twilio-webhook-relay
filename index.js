@@ -13,6 +13,16 @@ const FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
 const DAD_NUMBER = process.env.DAD_NUMBER;
 const JAMES_NUMBER = process.env.JAMES_NUMBER;
 const TEST_NUMBER = process.env.TEST_NUMBER;
+const DEBUG_MODE = process.env.DEBUG_MODE === 'true'; // When true, all SMS go to James instead of dad
+
+function smsTo(number) {
+  // In debug mode, redirect dad's number to James so we don't bother dad
+  if (DEBUG_MODE && number === DAD_NUMBER) {
+    console.log(`[DEBUG] Redirecting SMS from ${number} to ${JAMES_NUMBER}`);
+    return JAMES_NUMBER;
+  }
+  return number;
+}
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const DAD_ADDRESS = process.env.DAD_ADDRESS || '2713 Emerald Ct., Atwater, CA 95301';
 const LAUNCHER_SECRET = process.env.LAUNCHER_SECRET || 'doordash-secret';
@@ -128,13 +138,13 @@ app.post('/webhook', async (req, res) => {
       pendingOrder = { ...order, confirmedAt: Date.now() };
 
       await sendSMS(JAMES_NUMBER, `✅ Got it! Opening DoorDash on your laptop now...`);
-      await sendSMS(DAD_NUMBER, `Great news! Your order is being placed now. 🍔 Estimated arrival: 35-45 mins. Enjoy!`);
+      await sendSMS(smsTo(DAD_NUMBER), `Great news! Your order is being placed now. 🍔 Estimated arrival: 35-45 mins. Enjoy!`);
       await notifyDiscord(`✅ **Order confirmed by James!** Opening DoorDash now...\n🏪 ${order.restaurant} — ${order.item}\n📍 ${order.address}`);
 
     } else if (isCancellation(smsBody) && hasPendingOrder) {
       conversations.delete('james_pending');
       await sendSMS(JAMES_NUMBER, `❌ Order cancelled.`);
-      await sendSMS(DAD_NUMBER, `Hey! We had a small issue with your order. Please try again or call James. Sorry!`);
+      await sendSMS(smsTo(DAD_NUMBER), `Hey! We had a small issue with your order. Please try again or call James. Sorry!`);
     } else {
       console.log(`James: no pending order or unrecognized message`);
     }
@@ -155,7 +165,7 @@ app.post('/webhook', async (req, res) => {
       conversations.set(DAD_NUMBER, { state: STATE.AWAITING_JAMES_CONFIRM, order });
       conversations.set('james_pending', order);
 
-      await sendSMS(DAD_NUMBER, `Perfect! I'm sending it to James for approval. You'll get a text once it's placed! 🍔`);
+      await sendSMS(smsTo(DAD_NUMBER), `Perfect! I'm sending it to James for approval. You'll get a text once it's placed! 🍔`);
       await sendSMS(JAMES_NUMBER,
         `📦 Dad's DoorDash Order:\n🏪 ${order.restaurant}\n🍔 ${order.item}\n📍 ${order.address}\n\nReply CONFIRM to place or CANCEL to reject.`
       );
@@ -165,7 +175,7 @@ app.post('/webhook', async (req, res) => {
 
     } else if (isCancellation(smsBody)) {
       conversations.set(DAD_NUMBER, { state: STATE.IDLE });
-      await sendSMS(DAD_NUMBER, `No problem! Order cancelled. Text me anytime! 😊`);
+      await sendSMS(smsTo(DAD_NUMBER), `No problem! Order cancelled. Text me anytime! 😊`);
 
     } else {
       const { item, restaurant } = parseOrder(smsBody);
@@ -173,7 +183,7 @@ app.post('/webhook', async (req, res) => {
       const finalRestaurant = restaurant || conv.order.restaurant;
       const order = { item: finalItem, restaurant: finalRestaurant, address: DAD_ADDRESS };
       conversations.set(DAD_NUMBER, { state: STATE.AWAITING_ITEM_CONFIRM, order });
-      await sendSMS(DAD_NUMBER,
+      await sendSMS(smsTo(DAD_NUMBER),
         `Got it! So you want:\n🍔 ${finalItem}\n🏪 from ${finalRestaurant}\n📍 to ${DAD_ADDRESS}\n\nDoes that sound right? (Yes/No)`
       );
     }
@@ -183,7 +193,7 @@ app.post('/webhook', async (req, res) => {
   // New order
   const { item, restaurant } = parseOrder(smsBody);
   if (!restaurant) {
-    await sendSMS(DAD_NUMBER, `Hey! What restaurant do you want? Example: "I want a burger from McDonald's"`);
+    await sendSMS(smsTo(DAD_NUMBER), `Hey! What restaurant do you want? Example: "I want a burger from McDonald's"`);
     return;
   }
 
@@ -191,7 +201,7 @@ app.post('/webhook', async (req, res) => {
   const order = { item: finalItem, restaurant, address: DAD_ADDRESS };
   conversations.set(DAD_NUMBER, { state: STATE.AWAITING_ITEM_CONFIRM, order });
 
-  await sendSMS(DAD_NUMBER,
+  await sendSMS(smsTo(DAD_NUMBER),
     `Hey! Got your order 😊\n🍔 ${finalItem}\n🏪 from ${restaurant}\n📍 to ${DAD_ADDRESS}\n\nDoes that sound right? Reply YES to confirm or tell me what to change.`
   );
 });
