@@ -206,6 +206,21 @@ app.post('/webhook', async (req, res) => {
   );
 });
 
+// Test inject endpoint — lets Iris push a test order directly
+app.post('/api/test-order', (req, res) => {
+  const secret = req.headers['x-launcher-secret'] || req.query.secret;
+  if (secret !== LAUNCHER_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+  const { restaurant, item, address } = req.body;
+  pendingOrder = {
+    restaurant: restaurant || "McDonald's",
+    item: item || 'Big Mac Meal (Large)',
+    address: address || DAD_ADDRESS,
+    confirmedAt: Date.now()
+  };
+  console.log(`Test order injected: ${pendingOrder.item} from ${pendingOrder.restaurant}`);
+  res.json({ ok: true, order: pendingOrder });
+});
+
 // Laptop polling endpoint
 app.get('/api/pending-order', (req, res) => {
   const secret = req.headers['x-launcher-secret'] || req.query.secret;
