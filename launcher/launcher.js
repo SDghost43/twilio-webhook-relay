@@ -2,32 +2,90 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const fetch = require('node-fetch');
 const path = require('path');
+const fs = require('fs');
 
 const RAILWAY_URL = process.env.RAILWAY_URL;
 const LAUNCHER_SECRET = process.env.LAUNCHER_SECRET;
 const DD_EMAIL = process.env.DD_EMAIL;
 const DD_PASSWORD = process.env.DD_PASSWORD;
-const POLL_INTERVAL_MS = 30000; // poll every 30 seconds
+const POLL_INTERVAL_MS = 30000;
 
-// Persistent browser profile so DoorDash keeps us logged in
 const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
+const ARTIFACTS_DIR = path.join(__dirname, 'artifacts');
+fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 
-// ── Menu mappings per restaurant ──────────────────────────────────────────────
-// Each entry maps keywords to DoorDash search/item strings
 const RESTAURANT_MAP = {
   "mcdonald's": { name: "McDonald's", keywords: ['mcdonald', 'mcdonalds', 'mickey d', 'big mac', 'quarter pounder', 'mcnugget', 'mcchicken', 'happy meal', 'fillet-o-fish'] },
-  "taco bell": { name: "Taco Bell", keywords: ['taco bell', 'tacobell', 'taco', 'burrito', 'quesadilla', 'chalupa', 'crunchwrap', 'nacho', 'gordita', 'crunch wrap'] },
+  'taco bell': { name: 'Taco Bell', keywords: ['taco bell', 'tacobell', 'taco', 'burrito', 'quesadilla', 'chalupa', 'crunchwrap', 'nacho', 'gordita'] },
   "wendy's": { name: "Wendy's", keywords: ['wendy', 'wendys', 'baconator', 'frosty', 'dave', 'spicy chicken'] },
 };
 
+const ITEM_ALIASES = {
+  "McDonald's": {
+    'big mac meal': ['big mac meal', 'big mac® meal', 'big mac combo'],
+    'quarter pounder meal': ['quarter pounder with cheese meal', 'quarter pounder® with cheese meal', 'quarter pounder meal'],
+    'mcchicken meal': ['mcchicken meal', 'mcchicken® meal'],
+    '10 piece nuggets meal': ['10 pc. chicken mcnuggets® meal', '10 pc nuggets meal', '10 piece nuggets meal']
+  },
+  'Taco Bell': {},
+  "Wendy's": {}
+};
+
 function detectRestaurant(restaurantText) {
-  const lower = restaurantText.toLowerCase();
+  const lower = (restaurantText || '').toLowerCase();
   for (const [key, val] of Object.entries(RESTAURANT_MAP)) {
-    if (lower.includes(key) || val.keywords.some(k => lower.includes(k))) {
-      return val.name;
+    if (lower.includes(key) || val.keywords.some(k => lower.includes(k))) return val.name;
+  }
+  return restaurantText;
+}
+
+function normalizeText(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[®™'’.,()/:-]/g, ' ')
+    .replace(/\bcombo\b/g, ' meal ')
+    .replace(/\blg\b/g, ' large ')
+    .replace(/\bsm\b/g, ' small ')
+    .replace(/\bmed\b/g, ' medium ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractBaseItem(itemText) {
+  let t = normalizeText(itemText);
+  t = t.replace(/\b(large|medium|small)\b/g, ' ').replace(/\s+/g, ' ').trim();
+  return t;
+}
+
+function buildSearchTerms(restaurantName, itemText) {
+  const base = extractBaseItem(itemText);
+  const aliases = ITEM_ALIASES[restaurantName] || {};
+  const terms = new Set([base]);
+  for (const [canonical, vals] of Object.entries(aliases)) {
+    if (base.includes(canonical) || canonical.includes(base)) {
+      vals.forEach(v => terms.add(normalizeText(v)));
     }
   }
-  return restaurantText; // fallback: use as-is
+  const words = base.split(' ').filter(Boolean);
+  if (words.length >= 2) terms.add(words.slice(0, 2).join(' '));
+  if (words.length >= 1) terms.add(words[0]);
+  return [...terms].filter(Boolean);
+}
+
+function scoreCandidate(requestedItem, candidateText) {
+  const req = extractBaseItem(requestedItem);
+  const cand = normalizeText(candidateText);
+  const reqTokens = req.split(' ').filter(Boolean);
+  const candTokens = cand.split(' ').filter(Boolean);
+  if (!candTokens.length) return 0;
+
+  let score = 0;
+  const overlap = reqTokens.filter(t => candTokens.includes(t)).length;
+  score += (overlap / Math.max(reqTokens.length, 1)) * 0.7;
+  if (cand.includes(req)) score += 0.25;
+  if (req.includes('meal') && !cand.includes('meal')) score -= 0.2;
+  if (req.includes('mac') && !cand.includes('mac')) score -= 0.35;
+  return Math.max(0, Math.min(1, score));
 }
 
 async function checkForOrder() {
@@ -39,6 +97,52 @@ async function checkForOrder() {
     console.error('Poll error:', err.message);
     return null;
   }
+}
+
+async function takeScreenshot(page, prefix) {
+  const file = path.join(ARTIFACTS_DIR, `${Date.now()}-${prefix}.png`);
+  await page.screenshot({ path: file, fullPage: true }).catch(() => {});
+  return file;
+}
+
+async function findMenuItem(page, restaurantName, itemText) {
+  const searchTerms = buildSearchTerms(restaurantName, itemText);
+  console.log(`  → Search terms: ${searchTerms.join(' | ')}`);
+
+  for (const term of searchTerms.slice(0, 3)) {
+    const menuSearch = await page.$('[data-anchor-id="MenuSearch"], input[placeholder*="Search"], [aria-label*="Search"]');
+    if (menuSearch) {
+      await menuSearch.click().catch(() => {});
+      await page.waitForTimeout(400);
+      try { await page.keyboard.press('Control+A'); } catch {}
+      try { await page.keyboard.press('Meta+A'); } catch {}
+      await page.keyboard.press('Backspace').catch(() => {});
+      await page.keyboard.type(term, { delay: 60 });
+      await page.waitForTimeout(1800);
+    }
+
+    const candidateHandles = await page.$$('[data-anchor-id="MenuItem"], [data-testid="menuItem"], [data-anchor-id="MenuItemButton"], button, a');
+    const candidates = [];
+    for (const handle of candidateHandles.slice(0, 80)) {
+      const text = normalizeText(await handle.innerText().catch(() => ''));
+      if (!text || text.length < 4) continue;
+      const score = scoreCandidate(itemText, text);
+      if (score > 0.35) candidates.push({ handle, text, score });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    if (candidates.length) {
+      console.log('  → Best candidates:');
+      candidates.slice(0, 3).forEach(c => console.log(`     - ${c.text} (${c.score.toFixed(2)})`));
+      const best = candidates[0];
+      const second = candidates[1];
+      if (best.score >= 0.85 && (!second || best.score - second.score >= 0.1)) {
+        return { handle: best.handle, debug: candidates.slice(0, 3).map(c => `${c.text} (${c.score.toFixed(2)})`) };
+      }
+    }
+  }
+
+  return { handle: null, debug: [] };
 }
 
 async function placeOrder(order) {
@@ -55,42 +159,26 @@ async function placeOrder(order) {
     viewport: { width: 1280, height: 800 },
     args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
   });
-
   const page = browser.pages()[0] || await browser.newPage();
 
   try {
-    // ── Step 1: Go to DoorDash ────────────────────────────────────────────────
     console.log('  → Opening DoorDash...');
     await page.goto('https://www.doordash.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2000);
 
-    // ── Step 2: Reuse saved login session if possible ────────────────────────
-    // DoorDash changes selectors a lot, so prefer the persisted browser profile.
     const currentUrl = page.url();
     const looksLoggedOut = currentUrl.includes('/login') || currentUrl.includes('/consumer/login');
-
     if (looksLoggedOut) {
       console.log('  → DoorDash still wants login; trying once with saved credentials...');
       await page.goto('https://www.doordash.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(2000);
-
       const emailInput = await page.$('input[name="email"], input[type="email"], input[autocomplete="email"]');
       const passwordInput = await page.$('input[name="password"], input[type="password"], input[autocomplete="current-password"]');
-
-      if (!emailInput || !passwordInput) {
-        throw new Error('DoorDash login page did not expose recognizable email/password fields. Log into the Playwright Chrome window manually once, then retry.');
-      }
-
+      if (!emailInput || !passwordInput) throw new Error('DoorDash login fields not found.');
       await emailInput.fill(DD_EMAIL);
-      await page.waitForTimeout(500);
       await passwordInput.fill(DD_PASSWORD);
-      await page.waitForTimeout(500);
-
       const submitBtn = await page.$('button[type="submit"], button:has-text("Sign In"), button:has-text("Continue")');
-      if (!submitBtn) {
-        throw new Error('Could not find DoorDash login submit button.');
-      }
-
+      if (!submitBtn) throw new Error('Could not find DoorDash login submit button.');
       await submitBtn.click();
       await page.waitForTimeout(4000);
       console.log('  → Login submitted');
@@ -98,137 +186,92 @@ async function placeOrder(order) {
       console.log('  → Reusing saved DoorDash session');
     }
 
-    // ── Step 3: Search for restaurant ────────────────────────────────────────
     console.log(`  → Searching for ${restaurantName}...`);
     await page.goto(`https://www.doordash.com/search/store/${encodeURIComponent(restaurantName)}`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000
+      waitUntil: 'domcontentloaded', timeout: 30000
     });
     await page.waitForTimeout(2000);
 
-    // Open first restaurant result by href instead of clicking (DoorDash overlays intercept clicks)
     const storeLink = await page.$('a[data-anchor-id="StoreCard"], [data-anchor-id="StoreListItem"] a[href*="/store/"], a[href*="/store/"]');
-
-    if (!storeLink) {
-      throw new Error(`Could not find ${restaurantName} in search results`);
-    }
-
+    if (!storeLink) throw new Error(`Could not find ${restaurantName} in search results`);
     const href = await storeLink.getAttribute('href');
-    if (!href) {
-      throw new Error(`Found ${restaurantName} result but could not read its link`);
-    }
-
+    if (!href) throw new Error(`Found ${restaurantName} result but could not read its link`);
     const storeUrl = href.startsWith('http') ? href : `https://www.doordash.com${href}`;
     console.log(`  → Opening store directly: ${storeUrl}`);
     await page.goto(storeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
     console.log(`  → Opened ${restaurantName}`);
 
-    // ── Step 4: Search for item ───────────────────────────────────────────────
     console.log(`  → Looking for item: ${order.item}`);
-
-    // Try clicking the search icon within the restaurant
-    const menuSearch = await page.$('[data-anchor-id="MenuSearch"]') ||
-                       await page.$('input[placeholder*="Search"]') ||
-                       await page.$('[aria-label*="Search"]');
-
-    if (menuSearch) {
-      await menuSearch.click();
-      await page.waitForTimeout(500);
-
-      // Extract core item name (first 1-2 words usually)
-      const searchTerm = order.item.split(' ').slice(0, 3).join(' ');
-      await page.keyboard.type(searchTerm, { delay: 80 });
-      await page.waitForTimeout(1500);
+    const match = await findMenuItem(page, restaurantName, order.item);
+    if (!match.handle) {
+      const screenshot = await takeScreenshot(page, 'item-not-found');
+      throw new Error(`Could not confidently find item "${order.item}" on menu. Screenshot: ${screenshot}${match.debug.length ? ` | Candidates: ${match.debug.join('; ')}` : ''}`);
     }
 
-    // Click first menu item that appears
-    const menuItem = await page.$('[data-anchor-id="MenuItem"]') ||
-                     await page.$('[data-testid="menuItem"]') ||
-                     await page.$('[data-anchor-id="MenuItemButton"]');
-
-    if (!menuItem) {
-      throw new Error(`Could not find item "${order.item}" on menu`);
-    }
-    await menuItem.click();
+    await match.handle.click();
     await page.waitForTimeout(2000);
     console.log('  → Item selected');
 
-    // ── Step 5: Handle modifiers/customization ────────────────────────────────
-    // Click through any required modifier groups (pick first option)
-    const requiredGroups = await page.$$('[data-anchor-id="ItemCustomizationSection"][data-required="true"]');
-    for (const group of requiredGroups) {
-      const firstOption = await group.$('input[type="radio"], input[type="checkbox"]');
-      if (firstOption) await firstOption.click();
-      await page.waitForTimeout(300);
+    const requiredGroups = await page.$$('[data-anchor-id="ItemCustomizationSection"], [data-testid*="customization"], fieldset');
+    for (const group of requiredGroups.slice(0, 8)) {
+      const firstOption = await group.$('input[type="radio"], input[type="checkbox"], button[role="radio"], button[role="checkbox"]');
+      if (firstOption) {
+        await firstOption.click().catch(() => {});
+        await page.waitForTimeout(250);
+      }
     }
 
-    // ── Step 6: Add to cart ───────────────────────────────────────────────────
-    const addToCart = await page.$('[data-anchor-id="AddToOrderButton"]') ||
-                      await page.$('button:has-text("Add to Order")') ||
-                      await page.$('button:has-text("Add to Cart")');
-
+    const addToCart = await page.$('[data-anchor-id="AddToOrderButton"], button:has-text("Add to Order"), button:has-text("Add to cart"), button:has-text("Add to Cart")');
     if (!addToCart) {
-      throw new Error('Could not find Add to Cart button');
+      const screenshot = await takeScreenshot(page, 'missing-add-to-cart');
+      throw new Error(`Could not find Add to Cart button. Screenshot: ${screenshot}`);
     }
     await addToCart.click();
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(2500);
     console.log('  → Added to cart');
 
-    // ── Step 7: Go to checkout ────────────────────────────────────────────────
-    const checkout = await page.$('[data-anchor-id="CheckoutButton"]') ||
-                     await page.$('button:has-text("Go to Checkout")') ||
-                     await page.$('a:has-text("Checkout")');
-
+    const checkout = await page.$('[data-anchor-id="CheckoutButton"], button:has-text("Go to Checkout"), a:has-text("Checkout")');
     if (checkout) {
-      await checkout.click();
+      await checkout.click().catch(() => {});
       await page.waitForTimeout(3000);
       console.log('  → At checkout');
     }
 
-    // ── Step 8: Place order ───────────────────────────────────────────────────
-    const placeOrderBtn = await page.$('[data-anchor-id="PlaceOrderButton"]') ||
-                          await page.$('button:has-text("Place Order")');
-
+    const preSubmitShot = await takeScreenshot(page, 'pre-submit');
+    const placeOrderBtn = await page.$('[data-anchor-id="PlaceOrderButton"], button:has-text("Place Order")');
     if (!placeOrderBtn) {
-      throw new Error('Could not find Place Order button — may need manual review');
+      throw new Error(`Could not find Place Order button — manual review needed. Screenshot: ${preSubmitShot}`);
     }
 
     console.log('  → Placing order...');
     await placeOrderBtn.click();
     await page.waitForTimeout(5000);
 
-    // Check if order was placed (look for confirmation)
-    const confirmation = await page.$('[data-anchor-id="OrderConfirmation"]') ||
-                         await page.$('text=Your order has been placed') ||
-                         await page.$('text=Order Confirmed');
-
+    const confirmation = await page.$('[data-anchor-id="OrderConfirmation"], text=Your order has been placed, text=Order Confirmed');
     if (confirmation) {
+      const confirmShot = await takeScreenshot(page, 'order-confirmed');
       console.log('  ✅ Order placed successfully!');
-      await notifyDiscord(order, true);
+      await notifyDiscord(order, true, `Confirmation screenshot: ${confirmShot}`);
     } else {
+      const screenshot = await takeScreenshot(page, 'submit-unknown');
       console.log('  ⚠️  Could not confirm order placed — check browser window');
-      await notifyDiscord(order, false);
+      await notifyDiscord(order, false, `Submit outcome unknown. Screenshot: ${screenshot}`);
     }
-
   } catch (err) {
     console.error(`  ❌ Error placing order: ${err.message}`);
     await notifyDiscord(order, false, err.message);
-    // Leave browser open so James can manually complete
   }
 
-  // Keep browser open for 5 minutes then close
   setTimeout(() => browser.close(), 5 * 60 * 1000);
 }
 
 async function notifyDiscord(order, success, error) {
   const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
   if (!webhookUrl) return;
-
   const content = success
-    ? `✅ **DoorDash order placed!**\n🏪 ${order.restaurant}\n🍔 ${order.item}\n📍 ${order.address}`
-    : `⚠️ **Order automation failed** — please check the browser\n🏪 ${order.restaurant}\n🍔 ${order.item}\n${error ? `❌ ${error}` : ''}`;
-
+    ? `✅ **DoorDash order placed!**\n🏪 ${order.restaurant}\n🍔 ${order.item}\n📍 ${order.address}\n${error || ''}`
+    : `⚠️ **Order automation failed**\n🏪 ${order.restaurant}\n🍔 ${order.item}\n${error ? `❌ ${error}` : ''}`;
   try {
     await fetch(webhookUrl, {
       method: 'POST',
@@ -240,16 +283,12 @@ async function notifyDiscord(order, success, error) {
   }
 }
 
-// ── Main polling loop ─────────────────────────────────────────────────────────
 async function main() {
   console.log('🚀 DD-Dad Launcher started');
   console.log(`   Polling Railway every ${POLL_INTERVAL_MS / 1000}s...`);
-
   while (true) {
     const order = await checkForOrder();
-    if (order) {
-      await placeOrder(order);
-    }
+    if (order) await placeOrder(order);
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 }
