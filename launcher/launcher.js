@@ -20,10 +20,38 @@ const ARTIFACTS_DIR = path.join(__dirname, 'artifacts');
 fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 
 // ── Restaurant mapping ───────────────────────────────────────────────────────
+// storeId = DoorDash store ID for Atwater, CA area
+// keywords = phrases that map to this restaurant in a free-text order
+// usualItems = dad's known usual orders (used for high-confidence fast matching)
 const RESTAURANT_MAP = {
-  "mcdonald's": { name: "McDonald's", storeId: '658754', keywords: ['mcdonald', 'mcdonalds', 'mickey d', 'big mac', 'quarter pounder', 'mcnugget', 'mcchicken', 'happy meal', 'fillet-o-fish'] },
-  'taco bell':  { name: 'Taco Bell',  storeId: '27489317',  keywords: ['taco bell', 'tacobell', 'taco', 'burrito', 'quesadilla', 'chalupa', 'crunchwrap', 'nacho'] },
-  "wendy's":    { name: "Wendy's",    storeId: '1287957',   keywords: ['wendy', 'wendys', 'baconator', 'frosty', 'dave', 'spicy chicken'] },
+  "mcdonald's":    { name: "McDonald's",               storeId: '658754',    keywords: ['mcdonald', 'mcdonalds', 'mickey d', 'big mac', 'quarter pounder', 'mcnugget', 'mcchicken', 'happy meal', 'filet-o-fish', 'hotcake', 'hash brown', 'mcdouble', 'french fries'],
+    usualItems: ['Big Mac® Meal', 'Hotcakes and Sausage', 'Apple Pie', 'Hash Browns', 'McDouble®', 'French Fries', 'Big Mac®'] },
+  'taco bell':     { name: 'Taco Bell',                storeId: '27489317',  keywords: ['taco bell', 'tacobell', 'nachos bellgrande', 'crunchy taco', 'cheese quesadilla', 'soft taco', 'nacho'],
+    usualItems: ['Nachos BellGrande®', 'Pepsi®', '3 Crunchy Tacos Supreme® Combo', 'Mild Sauce Packet', 'Cheese Quesadilla', 'Soft Taco Supreme®', 'Nachos BellGrande® Combo'] },
+  "wendy's":       { name: "Wendy's",                  storeId: '1287957',   keywords: ['wendy', 'wendys', 'baconator', 'frosty', 'jr bacon', 'chili', 'breakfast burrito', 'seasoned potato'],
+    usualItems: ['Chili', 'Jr. Bacon Cheeseburger', 'Breakfast Burrito (Sausage)', 'Seasoned Potatoes'] },
+  "applebee's":    { name: "Applebee's Grill & Bar",   storeId: '519727',    keywords: ['applebee', 'applebees', 'riblet', 'baby back rib', 'half rack'],
+    usualItems: ["Applebee's® Riblets Platter", 'Double-Glazed Baby Back Ribs', 'Half Rack Double-Glazed Baby Back Ribs'] },
+  'burger king':   { name: 'Burger King',              storeId: '335111',    keywords: ['burger king', 'bk', 'whopper', 'have-sies', 'impossible whopper', 'double cheeseburger'],
+    usualItems: ['Double Cheeseburger', 'Impossible™ Whopper', 'Have-sies™', 'Coca-Cola Zero Sugar', 'Impossible™ Whopper Meal'] },
+  'chipotle':      { name: 'Chipotle Mexican Grill',   storeId: '350689',    keywords: ['chipotle', 'burrito bowl', 'chips salsa', 'tomatillo'],
+    usualItems: ['Burrito', 'Chips & Tomatillo-Green Chili Salsa'] },
+  'cold stone':    { name: 'Cold Stone Creamery',      storeId: '1361819',   keywords: ['cold stone', 'coldstone', 'ice cream creation', 'create your own'],
+    usualItems: ['Create Your Own Creation'] },
+  'hong kong':     { name: 'Hong Kong Chinese Restaurant', storeId: '865766', keywords: ['hong kong', 'broccoli beef', 'steam rice', 'chinese'],
+    usualItems: ['Broccoli Beef', 'Steam Rice (small)'] },
+  'jack in the box': { name: 'Jack in the Box',        storeId: '288286',    keywords: ['jack in the box', 'jack', 'french toast sticks', 'sourdough jack'],
+    usualItems: ['6pc Classic French Toast Sticks Combo'] },
+  'panda express': { name: 'Panda Express',            storeId: '24852387',  keywords: ['panda express', 'panda', 'orange chicken', 'bigger plate', 'teriyaki'],
+    usualItems: ['Bowl', 'Bigger Plate', 'Plate', 'Teriyaki Sauce'] },
+  'pizza hut':     { name: 'Pizza Hut',                storeId: '23701962',  keywords: ['pizza hut', 'personal pan', 'pan pizza'],
+    usualItems: ['Personal Pan Pizza®'] },
+  'popeyes':       { name: 'Popeyes Louisiana Kitchen', storeId: '287302',   keywords: ['popeyes', 'popeye', 'signature chicken', '2pc chicken'],
+    usualItems: ['2Pc Signature Chicken Combo'] },
+  'round table':   { name: 'Round Table Pizza',        storeId: '380264',    keywords: ['round table', 'garlic parmesan twist', 'classic wings', 'mozzarella stick'],
+    usualItems: ['Garlic Parmesan Twists', 'Classic Wings', 'Mozzarella Sticks'] },
+  'wingstop':      { name: 'Wingstop',                 storeId: '784614',    keywords: ['wingstop', 'wing combo', 'seasoned fries', '6 pc wing', '10 wings'],
+    usualItems: ['Ultimate Meal Deals', '6 pc Wing Combo', '10 Wings', 'Seasoned Fries', '10 pc Wing Combo'] },
 };
 
 function detectRestaurant(text) {
@@ -31,6 +59,19 @@ function detectRestaurant(text) {
   for (const [key, val] of Object.entries(RESTAURANT_MAP)) {
     if (lower.includes(key) || val.keywords.some(k => lower.includes(k))) return val;
   }
+  return null;
+}
+
+function checkUsualItem(restaurantInfo, requestedItem) {
+  if (!restaurantInfo || !restaurantInfo.usualItems) return null;
+  const req = normalize(requestedItem);
+  let best = null, bestScore = 0;
+  for (const usual of restaurantInfo.usualItems) {
+    const s = score(requestedItem, usual);
+    if (s > bestScore) { bestScore = s; best = usual; }
+  }
+  // If high-confidence match against known usual item, return it
+  if (bestScore >= 0.75) return { name: best, score: bestScore, isUsual: true };
   return null;
 }
 
@@ -185,6 +226,9 @@ async function placeOrder(order) {
 
     // ── Step 3: Find best matching item ──────────────────────────────────────
     console.log(`  → Finding: "${order.item}"`);
+    // Check usual items first — fast path for repeat orders
+    const usualCheck = checkUsualItem(restaurant, order.item);
+    if (usualCheck) console.log(`  → Usual item match: "${usualCheck.name}" (${usualCheck.score.toFixed(2)})`);
     const match = bestMatch(order.item, menuItems);
 
     if (!match) {
