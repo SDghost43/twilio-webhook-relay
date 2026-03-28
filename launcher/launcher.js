@@ -22,8 +22,8 @@ fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 // ── Restaurant mapping ───────────────────────────────────────────────────────
 const RESTAURANT_MAP = {
   "mcdonald's": { name: "McDonald's", storeId: '658754', keywords: ['mcdonald', 'mcdonalds', 'mickey d', 'big mac', 'quarter pounder', 'mcnugget', 'mcchicken', 'happy meal', 'fillet-o-fish'] },
-  'taco bell':  { name: 'Taco Bell',  storeId: null,     keywords: ['taco bell', 'tacobell', 'taco', 'burrito', 'quesadilla', 'chalupa', 'crunchwrap', 'nacho'] },
-  "wendy's":    { name: "Wendy's",    storeId: null,     keywords: ['wendy', 'wendys', 'baconator', 'frosty', 'dave', 'spicy chicken'] },
+  'taco bell':  { name: 'Taco Bell',  storeId: '27489317',  keywords: ['taco bell', 'tacobell', 'taco', 'burrito', 'quesadilla', 'chalupa', 'crunchwrap', 'nacho'] },
+  "wendy's":    { name: "Wendy's",    storeId: '1287957',   keywords: ['wendy', 'wendys', 'baconator', 'frosty', 'dave', 'spicy chicken'] },
 };
 
 function detectRestaurant(text) {
