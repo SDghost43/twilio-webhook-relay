@@ -14,6 +14,7 @@ const LAUNCHER_SECRET = process.env.LAUNCHER_SECRET;
 const DD_EMAIL = process.env.DD_EMAIL;
 const DD_PASSWORD = process.env.DD_PASSWORD;
 const POLL_INTERVAL_MS = 30000;
+const DRY_RUN = process.env.DRY_RUN === 'true'; // When true, goes through full flow but doesn't place the DoorDash order
 
 const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
 const ARTIFACTS_DIR = path.join(__dirname, 'artifacts');
@@ -300,6 +301,16 @@ async function placeOrder(order) {
 
     // ── Step 8: Place order ───────────────────────────────────────────────────
     await screenshot(page, 'pre-submit');
+
+    if (DRY_RUN) {
+      console.log('  ⚠️  DRY RUN — stopping before Place Order click');
+      await notifyDiscord(order, false, '🧪 DRY RUN: Cart built successfully — order NOT placed (dry run mode)');
+      await notifyDiscord(order, true); // send success-style Discord message
+      console.log('  ✅ Dry run complete — cart ready, order not submitted');
+      setTimeout(() => browser.close(), 5 * 60 * 1000);
+      return;
+    }
+
     const placeOrderBtns = [
       '[data-anchor-id="PlaceOrderButton"]',
       'button:has-text("Place Order")',
