@@ -84,8 +84,8 @@ async function sendSMS(to, message) {
       body: params.toString()
     });
     const data = await resp.json();
-    if (data.error_code) {
-      console.error(`SMS send error: ${data.error_message} (code ${data.error_code})`);
+    if (!resp.ok) {
+      console.error(`SMS send error (HTTP ${resp.status}): ${JSON.stringify(data)}`);
     } else {
       console.log(`SMS sent to ${to} — status: ${data.status}`);
     }
