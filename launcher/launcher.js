@@ -72,8 +72,8 @@ function bestMatch(requested, items) {
     .sort((a, b) => b.score - a.score);
 
   if (!scored.length) return null;
-  const best = scored[0], second = scored[1];
-  if (best.score >= 0.78 && (!second || best.score - second.score >= 0.08)) return best;
+  const best = scored[0];
+  if (best.score >= 0.78) return best; // take first high-confidence match (dupes are fine — same item)
   return null;
 }
 
