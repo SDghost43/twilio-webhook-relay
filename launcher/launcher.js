@@ -64,25 +64,38 @@ async function placeOrder(order) {
     await page.goto('https://www.doordash.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2000);
 
-    // ── Step 2: Log in if needed ──────────────────────────────────────────────
-    const isLoggedIn = await page.$('[data-anchor-id="AccountDropdown"]') ||
-                       await page.$('[data-testid="account-name"]') ||
-                       await page.$('text=Sign Out');
+    // ── Step 2: Reuse saved login session if possible ────────────────────────
+    // DoorDash changes selectors a lot, so prefer the persisted browser profile.
+    const currentUrl = page.url();
+    const looksLoggedOut = currentUrl.includes('/login') || currentUrl.includes('/consumer/login');
 
-    if (!isLoggedIn) {
-      console.log('  → Logging in...');
+    if (looksLoggedOut) {
+      console.log('  → DoorDash still wants login; trying once with saved credentials...');
       await page.goto('https://www.doordash.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(2000);
 
-      await page.fill('input[name="email"]', DD_EMAIL);
+      const emailInput = await page.$('input[name="email"], input[type="email"], input[autocomplete="email"]');
+      const passwordInput = await page.$('input[name="password"], input[type="password"], input[autocomplete="current-password"]');
+
+      if (!emailInput || !passwordInput) {
+        throw new Error('DoorDash login page did not expose recognizable email/password fields. Log into the Playwright Chrome window manually once, then retry.');
+      }
+
+      await emailInput.fill(DD_EMAIL);
       await page.waitForTimeout(500);
-      await page.fill('input[name="password"]', DD_PASSWORD);
+      await passwordInput.fill(DD_PASSWORD);
       await page.waitForTimeout(500);
-      await page.click('button[type="submit"]');
-      await page.waitForTimeout(3000);
-      console.log('  → Logged in!');
+
+      const submitBtn = await page.$('button[type="submit"], button:has-text("Sign In"), button:has-text("Continue")');
+      if (!submitBtn) {
+        throw new Error('Could not find DoorDash login submit button.');
+      }
+
+      await submitBtn.click();
+      await page.waitForTimeout(4000);
+      console.log('  → Login submitted');
     } else {
-      console.log('  → Already logged in');
+      console.log('  → Reusing saved DoorDash session');
     }
 
     // ── Step 3: Search for restaurant ────────────────────────────────────────
