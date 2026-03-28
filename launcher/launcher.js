@@ -292,7 +292,23 @@ async function placeOrder(order) {
     await page.waitForSelector(
       '[data-anchor-id="MenuItem"], [data-testid="menuItem"], [data-anchor-id="MenuItemButton"]',
       { timeout: 10000, state: 'visible' }
-    ).catch(() => console.log('  ⚠️  No menu item selectors found yet, proceeding anyway'));
+    ).catch(() => console.log('  ⚠️  Standard menu selectors not found, will do broad scan'));
+
+    // Diagnostic: print all data-anchor-id values to find real menu selectors
+    const anchorIds = await page.evaluate(() => {
+      const els = document.querySelectorAll('[data-anchor-id]');
+      const ids = new Set();
+      els.forEach(el => ids.add(el.getAttribute('data-anchor-id')));
+      return [...ids].sort();
+    });
+    if (anchorIds.length) {
+      console.log(`  → data-anchor-ids on page: ${anchorIds.slice(0, 30).join(', ')}`);
+    }
+
+    // Also extract some visible text to confirm content loaded
+    const pageText = await page.evaluate(() => document.body.innerText.substring(0, 800));
+    console.log(`  → Page text sample: ${pageText.replace(/\s+/g, ' ').substring(0, 300)}`);
+
     await page.waitForTimeout(1000);
 
     console.log(`  → Looking for item: ${order.item}`);
