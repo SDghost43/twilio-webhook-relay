@@ -94,16 +94,45 @@ function scoreCandidate(requestedItem, candidateText) {
 }
 
 async function collectTextCandidates(page) {
-  const handles = await page.$$('button, a, [role="button"], [data-anchor-id], h1, h2, h3, h4, div, span');
+  // DoorDash doesn't use data-anchor-id on menu items — extract via page text + elements
+  const results = await page.evaluate(() => {
+    const items = [];
+    const seen = new Set();
+    // Walk all leaf-ish elements
+    const els = document.querySelectorAll('span, p, h1, h2, h3, h4, button, a, div[role="button"]');
+    for (const el of els) {
+      const t = (el.textContent || '').trim();
+      if (!t || t.length < 4 || t.length > 120) continue;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      // Get a clickable ancestor
+      let clickable = el;
+      let parent = el.parentElement;
+      for (let i = 0; i < 5 && parent; i++) {
+        if (parent.tagName === 'A' || parent.tagName === 'BUTTON' ||
+            parent.getAttribute('role') === 'button' ||
+            parent.onclick) {
+          clickable = parent;
+          break;
+        }
+        parent = parent.parentElement;
+      }
+      items.push({ text: t, tag: clickable.tagName, selector: null });
+    }
+    return items;
+  });
+
+  // Now get actual handles for the menu-relevant items
   const out = [];
   const seen = new Set();
-  for (const handle of handles.slice(0, 400)) {
-    const text = (await handle.innerText().catch(() => '') || '').trim();
-    const norm = normalizeText(text);
-    if (!norm || norm.length < 4 || norm.length > 120) continue;
+  for (const item of results) {
+    const norm = normalizeText(item.text);
+    if (!norm || norm.length < 4 || norm.length > 80) continue;
     if (seen.has(norm)) continue;
     seen.add(norm);
-    out.push({ handle, text: norm, raw: text });
+    // Find clickable handle by exact text match
+    const handle = await page.locator(`text="${item.text}"`).first().elementHandle().catch(() => null);
+    if (handle) out.push({ handle, text: norm, raw: item.text });
   }
   return out;
 }
@@ -315,15 +344,15 @@ async function placeOrder(order) {
     await page.mouse.wheel(0, -99999).catch(() => {});
     await page.waitForTimeout(1000);
 
-    // Wait for visible menu content
+    // Wait for visible menu content — DoorDash uses no data-anchor-id on menu items
+    // Items appear as span/div/p text nodes inside clickable containers
     const menuSelectors = [
-      '[data-anchor-id*="MenuItem"]',
-      'button:has-text("Add to cart")',
-      'h2:has-text("Most Ordered")',
-      'h2:has-text("Featured Items")',
-      'h2:has-text("Burgers")',
-      'h2:has-text("Meals")',
-      'h2:has-text("Combo")',
+      'span:has-text("Big Mac")',
+      'span:has-text("Extra Value Meals")',
+      'span:has-text("Burgers")',
+      'span:has-text("Chicken")',
+      'div:has-text("Add to Cart")',
+      'button:has-text("Add")',
     ];
     let foundMenuSelector = null;
     for (const sel of menuSelectors) {
