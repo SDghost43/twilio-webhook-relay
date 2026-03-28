@@ -94,19 +94,18 @@ function scoreCandidate(requestedItem, candidateText) {
 }
 
 async function collectTextCandidates(page) {
-  // DoorDash doesn't use data-anchor-id on menu items.
-  // textContent smashes child text together (e.g. "Big Mac®$8.29Last ordered 12/16")
-  // We use innerText split by newlines and take first line of each element to get clean item names.
+  // DoorDash menu item cards are div[role="button"] containing a span with the item name as first line.
+  // We find all role=button divs, read their first innerText line as the item name.
   const results = await page.evaluate(() => {
     const items = [];
     const seen = new Set();
-    const els = document.querySelectorAll('span, p, h1, h2, h3, h4, button, a, li, div');
-    for (const el of els) {
-      const raw = (el.innerText || '').trim();
+    // Target role=button divs (DoorDash menu item cards)
+    const cards = document.querySelectorAll('div[role="button"]');
+    for (const card of cards) {
+      const raw = (card.innerText || '').trim();
       if (!raw) continue;
-      // Take only the first non-empty line — avoids price/date contamination
       const firstLine = raw.split('\n').map(l => l.trim()).find(l => l.length > 2) || '';
-      if (!firstLine || firstLine.length < 4 || firstLine.length > 100) continue;
+      if (!firstLine || firstLine.length < 3 || firstLine.length > 80) continue;
       if (seen.has(firstLine)) continue;
       seen.add(firstLine);
       items.push(firstLine);
@@ -121,8 +120,19 @@ async function collectTextCandidates(page) {
     if (!norm || norm.length < 4 || norm.length > 80) continue;
     if (seen.has(norm)) continue;
     seen.add(norm);
-    const handle = await page.locator(`text="${raw}"`).first().elementHandle().catch(() => null);
-    if (handle) out.push({ handle, text: norm, raw });
+    // Click the div[role="button"] whose first innerText line matches
+    const handle = await page.evaluateHandle((targetText) => {
+      const cards = document.querySelectorAll('div[role="button"]');
+      for (const card of cards) {
+        const firstLine = (card.innerText || '').trim().split('\n').find(l => l.trim().length > 2);
+        if (firstLine && firstLine.trim() === targetText) return card;
+      }
+      return null;
+    }, raw).catch(() => null);
+
+    if (handle && (await handle.asElement())) {
+      out.push({ handle: handle.asElement(), text: norm, raw });
+    }
   }
   return out;
 }
