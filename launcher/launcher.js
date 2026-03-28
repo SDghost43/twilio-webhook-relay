@@ -279,6 +279,22 @@ async function placeOrder(order) {
     await page.waitForTimeout(3000);
     console.log(`  → Opened ${restaurantName}`);
 
+    // Trigger lazy loading by scrolling down and back up
+    console.log('  → Triggering lazy load...');
+    for (let i = 0; i < 6; i++) {
+      await page.mouse.wheel(0, 800).catch(() => {});
+      await page.waitForTimeout(600);
+    }
+    await page.mouse.wheel(0, -9999).catch(() => {});
+    await page.waitForTimeout(1000);
+
+    // Wait for at least one menu item to appear
+    await page.waitForSelector(
+      '[data-anchor-id="MenuItem"], [data-testid="menuItem"], [data-anchor-id="MenuItemButton"]',
+      { timeout: 10000, state: 'visible' }
+    ).catch(() => console.log('  ⚠️  No menu item selectors found yet, proceeding anyway'));
+    await page.waitForTimeout(1000);
+
     console.log(`  → Looking for item: ${order.item}`);
     const match = await findMenuItem(page, restaurantName, order.item);
     if (!match.handle) {
