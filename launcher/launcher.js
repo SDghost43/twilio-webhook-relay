@@ -14,6 +14,8 @@ const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
 const ARTIFACTS_DIR = path.join(__dirname, 'artifacts');
 fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 
+const AUTO_MATCH_THRESHOLD = 0.78;
+
 const RESTAURANT_MAP = {
   "mcdonald's": { name: "McDonald's", keywords: ['mcdonald', 'mcdonalds', 'mickey d', 'big mac', 'quarter pounder', 'mcnugget', 'mcchicken', 'happy meal', 'fillet-o-fish'] },
   'taco bell': { name: 'Taco Bell', keywords: ['taco bell', 'tacobell', 'taco', 'burrito', 'quesadilla', 'chalupa', 'crunchwrap', 'nacho', 'gordita'] },
@@ -81,11 +83,50 @@ function scoreCandidate(requestedItem, candidateText) {
 
   let score = 0;
   const overlap = reqTokens.filter(t => candTokens.includes(t)).length;
-  score += (overlap / Math.max(reqTokens.length, 1)) * 0.7;
-  if (cand.includes(req)) score += 0.25;
-  if (req.includes('meal') && !cand.includes('meal')) score -= 0.2;
+  score += (overlap / Math.max(reqTokens.length, 1)) * 0.65;
+  if (cand.includes(req)) score += 0.22;
+  if (req.includes('meal') && cand.includes('meal')) score += 0.08;
+  if (req.includes('mac') && cand.includes('mac')) score += 0.10;
+  if (req.includes('meal') && !cand.includes('meal')) score -= 0.15;
   if (req.includes('mac') && !cand.includes('mac')) score -= 0.35;
+  if (cand.includes('double') && !req.includes('double')) score -= 0.15;
   return Math.max(0, Math.min(1, score));
+}
+
+async function collectTextCandidates(page) {
+  const handles = await page.$$('button, a, [role="button"], [data-anchor-id], h1, h2, h3, h4, div, span');
+  const out = [];
+  const seen = new Set();
+  for (const handle of handles.slice(0, 400)) {
+    const text = (await handle.innerText().catch(() => '') || '').trim();
+    const norm = normalizeText(text);
+    if (!norm || norm.length < 4 || norm.length > 120) continue;
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    out.push({ handle, text: norm, raw: text });
+  }
+  return out;
+}
+
+async function tryBuyAgain(page, itemText) {
+  const candidates = await collectTextCandidates(page);
+  const matches = candidates
+    .map(c => ({ ...c, score: scoreCandidate(itemText, c.text) + (c.text.includes('again') ? 0.05 : 0) }))
+    .filter(c => c.score >= 0.55 && (/again|buy again|reorder|order again|recent/i.test(c.raw)));
+  matches.sort((a, b) => b.score - a.score);
+  return matches[0] || null;
+}
+
+async function clearMenuSearch(page) {
+  const menuSearch = await page.$('[data-anchor-id="MenuSearch"], input[placeholder*="Search"], [aria-label*="Search"]');
+  if (!menuSearch) return false;
+  await menuSearch.click().catch(() => {});
+  await page.waitForTimeout(250);
+  try { await page.keyboard.press('Control+A'); } catch {}
+  try { await page.keyboard.press('Meta+A'); } catch {}
+  await page.keyboard.press('Backspace').catch(() => {});
+  await page.waitForTimeout(600);
+  return true;
 }
 
 async function checkForOrder() {
@@ -109,40 +150,74 @@ async function findMenuItem(page, restaurantName, itemText) {
   const searchTerms = buildSearchTerms(restaurantName, itemText);
   console.log(`  → Search terms: ${searchTerms.join(' | ')}`);
 
+  // Pass 0: try Buy Again / Recently Ordered / Order Again shortcuts first
+  const buyAgain = await tryBuyAgain(page, itemText);
+  if (buyAgain && buyAgain.score >= 0.75) {
+    console.log(`  → Buy Again candidate: ${buyAgain.text} (${buyAgain.score.toFixed(2)})`);
+    return { handle: buyAgain.handle, debug: [`buy-again: ${buyAgain.text} (${buyAgain.score.toFixed(2)})`] };
+  }
+
+  let bestOverall = [];
+
+  // Pass 1-3: search terms
   for (const term of searchTerms.slice(0, 3)) {
     const menuSearch = await page.$('[data-anchor-id="MenuSearch"], input[placeholder*="Search"], [aria-label*="Search"]');
     if (menuSearch) {
-      await menuSearch.click().catch(() => {});
-      await page.waitForTimeout(400);
-      try { await page.keyboard.press('Control+A'); } catch {}
-      try { await page.keyboard.press('Meta+A'); } catch {}
-      await page.keyboard.press('Backspace').catch(() => {});
+      await clearMenuSearch(page);
       await page.keyboard.type(term, { delay: 60 });
       await page.waitForTimeout(1800);
     }
 
-    const candidateHandles = await page.$$('[data-anchor-id="MenuItem"], [data-testid="menuItem"], [data-anchor-id="MenuItemButton"], button, a');
-    const candidates = [];
-    for (const handle of candidateHandles.slice(0, 80)) {
-      const text = normalizeText(await handle.innerText().catch(() => ''));
-      if (!text || text.length < 4) continue;
-      const score = scoreCandidate(itemText, text);
-      if (score > 0.35) candidates.push({ handle, text, score });
-    }
+    const candidates = (await collectTextCandidates(page))
+      .map(c => ({ ...c, score: scoreCandidate(itemText, c.text) }))
+      .filter(c => c.score > 0.42)
+      .sort((a, b) => b.score - a.score);
 
-    candidates.sort((a, b) => b.score - a.score);
     if (candidates.length) {
-      console.log('  → Best candidates:');
+      console.log(`  → Candidates for "${term}":`);
       candidates.slice(0, 3).forEach(c => console.log(`     - ${c.text} (${c.score.toFixed(2)})`));
+      bestOverall = [...bestOverall, ...candidates.slice(0, 5)];
       const best = candidates[0];
       const second = candidates[1];
-      if (best.score >= 0.85 && (!second || best.score - second.score >= 0.1)) {
+      if (best.score >= AUTO_MATCH_THRESHOLD && (!second || best.score - second.score >= 0.08)) {
         return { handle: best.handle, debug: candidates.slice(0, 3).map(c => `${c.text} (${c.score.toFixed(2)})`) };
       }
     }
   }
 
-  return { handle: null, debug: [] };
+  // Pass 4: clear search and scan full visible menu / categories
+  await clearMenuSearch(page);
+  await page.waitForTimeout(800);
+  for (let i = 0; i < 3; i++) {
+    await page.mouse.wheel(0, 900).catch(() => {});
+    await page.waitForTimeout(700);
+  }
+  const pageWideCandidates = (await collectTextCandidates(page))
+    .map(c => ({ ...c, score: scoreCandidate(itemText, c.text) }))
+    .filter(c => c.score > 0.38)
+    .sort((a, b) => b.score - a.score);
+
+  if (pageWideCandidates.length) {
+    console.log('  → Page-wide candidates:');
+    pageWideCandidates.slice(0, 5).forEach(c => console.log(`     - ${c.text} (${c.score.toFixed(2)})`));
+    bestOverall = [...bestOverall, ...pageWideCandidates.slice(0, 5)];
+    const best = pageWideCandidates[0];
+    const second = pageWideCandidates[1];
+    if (best.score >= AUTO_MATCH_THRESHOLD && (!second || best.score - second.score >= 0.08)) {
+      return { handle: best.handle, debug: pageWideCandidates.slice(0, 5).map(c => `${c.text} (${c.score.toFixed(2)})`) };
+    }
+  }
+
+  const dedup = [];
+  const seen = new Set();
+  for (const c of bestOverall.sort((a, b) => b.score - a.score)) {
+    const key = c.text;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dedup.push(c);
+  }
+
+  return { handle: null, debug: dedup.slice(0, 5).map(c => `${c.text} (${c.score.toFixed(2)})`) };
 }
 
 async function placeOrder(order) {
@@ -156,10 +231,12 @@ async function placeOrder(order) {
 
   const browser = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
-    viewport: { width: 1280, height: 800 },
-    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+    viewport: null,
+    screen: { width: 1600, height: 1000 },
+    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--start-maximized'],
   });
   const page = browser.pages()[0] || await browser.newPage();
+  await page.setViewportSize({ width: 1600, height: 1000 }).catch(() => {});
 
   try {
     console.log('  → Opening DoorDash...');
