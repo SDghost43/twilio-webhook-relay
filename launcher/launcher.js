@@ -1,3 +1,8 @@
+/**
+ * DD-Dad Launcher — DoorDash auto-ordering bot
+ * Uses DoorDash GraphQL API to find menu items (not DOM scraping)
+ * then navigates to the item page and places the order.
+ */
 require('dotenv').config();
 const { chromium } = require('playwright');
 const fetch = require('node-fetch');
@@ -14,150 +19,65 @@ const USER_DATA_DIR = path.join(__dirname, 'chrome-profile');
 const ARTIFACTS_DIR = path.join(__dirname, 'artifacts');
 fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 
-const AUTO_MATCH_THRESHOLD = 0.78;
-
+// ── Restaurant mapping ───────────────────────────────────────────────────────
 const RESTAURANT_MAP = {
-  "mcdonald's": { name: "McDonald's", keywords: ['mcdonald', 'mcdonalds', 'mickey d', 'big mac', 'quarter pounder', 'mcnugget', 'mcchicken', 'happy meal', 'fillet-o-fish'] },
-  'taco bell': { name: 'Taco Bell', keywords: ['taco bell', 'tacobell', 'taco', 'burrito', 'quesadilla', 'chalupa', 'crunchwrap', 'nacho', 'gordita'] },
-  "wendy's": { name: "Wendy's", keywords: ['wendy', 'wendys', 'baconator', 'frosty', 'dave', 'spicy chicken'] },
+  "mcdonald's": { name: "McDonald's", storeId: '658754', keywords: ['mcdonald', 'mcdonalds', 'mickey d', 'big mac', 'quarter pounder', 'mcnugget', 'mcchicken', 'happy meal', 'fillet-o-fish'] },
+  'taco bell':  { name: 'Taco Bell',  storeId: null,     keywords: ['taco bell', 'tacobell', 'taco', 'burrito', 'quesadilla', 'chalupa', 'crunchwrap', 'nacho'] },
+  "wendy's":    { name: "Wendy's",    storeId: null,     keywords: ['wendy', 'wendys', 'baconator', 'frosty', 'dave', 'spicy chicken'] },
 };
 
-const ITEM_ALIASES = {
-  "McDonald's": {
-    'big mac meal': ['big mac meal', 'big mac® meal', 'big mac combo'],
-    'quarter pounder meal': ['quarter pounder with cheese meal', 'quarter pounder® with cheese meal', 'quarter pounder meal'],
-    'mcchicken meal': ['mcchicken meal', 'mcchicken® meal'],
-    '10 piece nuggets meal': ['10 pc. chicken mcnuggets® meal', '10 pc nuggets meal', '10 piece nuggets meal']
-  },
-  'Taco Bell': {},
-  "Wendy's": {}
-};
-
-function detectRestaurant(restaurantText) {
-  const lower = (restaurantText || '').toLowerCase();
+function detectRestaurant(text) {
+  const lower = (text || '').toLowerCase();
   for (const [key, val] of Object.entries(RESTAURANT_MAP)) {
-    if (lower.includes(key) || val.keywords.some(k => lower.includes(k))) return val.name;
+    if (lower.includes(key) || val.keywords.some(k => lower.includes(k))) return val;
   }
-  return restaurantText;
+  return null;
 }
 
-function normalizeText(text) {
+// ── Text normalization & scoring ─────────────────────────────────────────────
+function normalize(text) {
   return (text || '')
     .toLowerCase()
-    .replace(/[®™'’.,()/:-]/g, ' ')
+    .replace(/[®™''.,()/:-]/g, ' ')
     .replace(/\bcombo\b/g, ' meal ')
     .replace(/\blg\b/g, ' large ')
-    .replace(/\bsm\b/g, ' small ')
-    .replace(/\bmed\b/g, ' medium ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-function extractBaseItem(itemText) {
-  let t = normalizeText(itemText);
-  t = t.replace(/\b(large|medium|small)\b/g, ' ').replace(/\s+/g, ' ').trim();
-  return t;
+function extractBase(text) {
+  return normalize(text).replace(/\b(large|medium|small)\b/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-function buildSearchTerms(restaurantName, itemText) {
-  const base = extractBaseItem(itemText);
-  const aliases = ITEM_ALIASES[restaurantName] || {};
-  const terms = new Set([base]);
-  for (const [canonical, vals] of Object.entries(aliases)) {
-    if (base.includes(canonical) || canonical.includes(base)) {
-      vals.forEach(v => terms.add(normalizeText(v)));
-    }
-  }
-  const words = base.split(' ').filter(Boolean);
-  if (words.length >= 2) terms.add(words.slice(0, 2).join(' '));
-  if (words.length >= 1) terms.add(words[0]);
-  return [...terms].filter(Boolean);
+function score(requested, candidate) {
+  const req = extractBase(requested);
+  const cand = normalize(candidate);
+  const rt = req.split(' ').filter(Boolean);
+  const ct = cand.split(' ').filter(Boolean);
+  if (!ct.length) return 0;
+  let s = (rt.filter(t => ct.includes(t)).length / Math.max(rt.length, 1)) * 0.60;
+  if (cand.includes(req)) s += 0.25;
+  if (req.includes('meal') && cand.includes('meal')) s += 0.10;
+  if (req.includes('mac') && cand.includes('mac')) s += 0.08;
+  if (req.includes('meal') && !cand.includes('meal')) s -= 0.15;
+  if (req.includes('mac') && !cand.includes('mac')) s -= 0.35;
+  if (cand.includes('double') && !req.includes('double')) s -= 0.15;
+  return Math.max(0, Math.min(1, s));
 }
 
-function scoreCandidate(requestedItem, candidateText) {
-  const req = extractBaseItem(requestedItem);
-  const cand = normalizeText(candidateText);
-  const reqTokens = req.split(' ').filter(Boolean);
-  const candTokens = cand.split(' ').filter(Boolean);
-  if (!candTokens.length) return 0;
+function bestMatch(requested, items) {
+  const scored = items
+    .map(item => ({ ...item, score: score(requested, item.name) }))
+    .filter(c => c.score > 0.35)
+    .sort((a, b) => b.score - a.score);
 
-  let score = 0;
-  const overlap = reqTokens.filter(t => candTokens.includes(t)).length;
-  score += (overlap / Math.max(reqTokens.length, 1)) * 0.65;
-  if (cand.includes(req)) score += 0.22;
-  if (req.includes('meal') && cand.includes('meal')) score += 0.08;
-  if (req.includes('mac') && cand.includes('mac')) score += 0.10;
-  if (req.includes('meal') && !cand.includes('meal')) score -= 0.15;
-  if (req.includes('mac') && !cand.includes('mac')) score -= 0.35;
-  if (cand.includes('double') && !req.includes('double')) score -= 0.15;
-  return Math.max(0, Math.min(1, score));
+  if (!scored.length) return null;
+  const best = scored[0], second = scored[1];
+  if (best.score >= 0.78 && (!second || best.score - second.score >= 0.08)) return best;
+  return null;
 }
 
-async function collectTextCandidates(page) {
-  // DoorDash menu item cards are div[role="button"] containing a span with the item name as first line.
-  // We find all role=button divs, read their first innerText line as the item name.
-  const results = await page.evaluate(() => {
-    const items = [];
-    const seen = new Set();
-    // Target role=button divs (DoorDash menu item cards)
-    const cards = document.querySelectorAll('div[role="button"]');
-    for (const card of cards) {
-      const raw = (card.innerText || '').trim();
-      if (!raw) continue;
-      const firstLine = raw.split('\n').map(l => l.trim()).find(l => l.length > 2) || '';
-      if (!firstLine || firstLine.length < 3 || firstLine.length > 80) continue;
-      if (seen.has(firstLine)) continue;
-      seen.add(firstLine);
-      items.push(firstLine);
-    }
-    return items;
-  });
-
-  const out = [];
-  const seen = new Set();
-  for (const raw of results) {
-    const norm = normalizeText(raw);
-    if (!norm || norm.length < 4 || norm.length > 80) continue;
-    if (seen.has(norm)) continue;
-    seen.add(norm);
-    // Click the div[role="button"] whose first innerText line matches
-    const handle = await page.evaluateHandle((targetText) => {
-      const cards = document.querySelectorAll('div[role="button"]');
-      for (const card of cards) {
-        const firstLine = (card.innerText || '').trim().split('\n').find(l => l.trim().length > 2);
-        if (firstLine && firstLine.trim() === targetText) return card;
-      }
-      return null;
-    }, raw).catch(() => null);
-
-    if (handle && (await handle.asElement())) {
-      out.push({ handle: handle.asElement(), text: norm, raw });
-    }
-  }
-  return out;
-}
-
-async function tryBuyAgain(page, itemText) {
-  const candidates = await collectTextCandidates(page);
-  const matches = candidates
-    .map(c => ({ ...c, score: scoreCandidate(itemText, c.text) + (c.text.includes('again') ? 0.05 : 0) }))
-    .filter(c => c.score >= 0.55 && (/again|buy again|reorder|order again|recent/i.test(c.raw)));
-  matches.sort((a, b) => b.score - a.score);
-  return matches[0] || null;
-}
-
-async function clearMenuSearch(page) {
-  const menuSearch = await page.$('[data-anchor-id="MenuSearch"], input[placeholder*="Search"], [aria-label*="Search"]');
-  if (!menuSearch) return false;
-  await menuSearch.click().catch(() => {});
-  await page.waitForTimeout(250);
-  try { await page.keyboard.press('Control+A'); } catch {}
-  try { await page.keyboard.press('Meta+A'); } catch {}
-  await page.keyboard.press('Backspace').catch(() => {});
-  await page.waitForTimeout(600);
-  return true;
-}
-
+// ── Railway API ──────────────────────────────────────────────────────────────
 async function checkForOrder() {
   try {
     const resp = await fetch(`${RAILWAY_URL}/api/pending-order?secret=${LAUNCHER_SECRET}`);
@@ -169,94 +89,36 @@ async function checkForOrder() {
   }
 }
 
-async function takeScreenshot(page, prefix) {
-  const file = path.join(ARTIFACTS_DIR, `${Date.now()}-${prefix}.png`);
-  await page.screenshot({ path: file, fullPage: true }).catch(() => {});
-  return file;
+// ── Discord notifications ────────────────────────────────────────────────────
+async function notifyDiscord(order, success, message) {
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  if (!webhookUrl) return;
+  const content = success
+    ? `✅ **DoorDash order placed!**\n🏪 ${order.restaurant}\n🍔 ${order.item}\n📍 ${order.address}`
+    : `⚠️ **Order failed** — ${message || 'check the browser'}\n🏪 ${order.restaurant}\n🍔 ${order.item}`;
+  try {
+    await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
+  } catch {}
 }
 
-async function findMenuItem(page, restaurantName, itemText) {
-  const searchTerms = buildSearchTerms(restaurantName, itemText);
-  console.log(`  → Search terms: ${searchTerms.join(' | ')}`);
-
-  // Pass 0: try Buy Again / Recently Ordered / Order Again shortcuts first
-  const buyAgain = await tryBuyAgain(page, itemText);
-  if (buyAgain && buyAgain.score >= 0.75) {
-    console.log(`  → Buy Again candidate: ${buyAgain.text} (${buyAgain.score.toFixed(2)})`);
-    return { handle: buyAgain.handle, debug: [`buy-again: ${buyAgain.text} (${buyAgain.score.toFixed(2)})`] };
-  }
-
-  let bestOverall = [];
-
-  // Pass 1-3: search terms
-  for (const term of searchTerms.slice(0, 3)) {
-    const menuSearch = await page.$('[data-anchor-id="MenuSearch"], input[placeholder*="Search"], [aria-label*="Search"]');
-    if (menuSearch) {
-      await clearMenuSearch(page);
-      await page.keyboard.type(term, { delay: 60 });
-      await page.waitForTimeout(1800);
-    }
-
-    const candidates = (await collectTextCandidates(page))
-      .map(c => ({ ...c, score: scoreCandidate(itemText, c.text) }))
-      .filter(c => c.score > 0.42)
-      .sort((a, b) => b.score - a.score);
-
-    if (candidates.length) {
-      console.log(`  → Candidates for "${term}":`);
-      candidates.slice(0, 3).forEach(c => console.log(`     - ${c.text} (${c.score.toFixed(2)})`));
-      bestOverall = [...bestOverall, ...candidates.slice(0, 5)];
-      const best = candidates[0];
-      const second = candidates[1];
-      if (best.score >= AUTO_MATCH_THRESHOLD && (!second || best.score - second.score >= 0.08)) {
-        return { handle: best.handle, debug: candidates.slice(0, 3).map(c => `${c.text} (${c.score.toFixed(2)})`) };
-      }
-    }
-  }
-
-  // Pass 4: clear search and scan full visible menu / categories
-  await clearMenuSearch(page);
-  await page.waitForTimeout(800);
-  for (let i = 0; i < 3; i++) {
-    await page.mouse.wheel(0, 900).catch(() => {});
-    await page.waitForTimeout(700);
-  }
-  const pageWideCandidates = (await collectTextCandidates(page))
-    .map(c => ({ ...c, score: scoreCandidate(itemText, c.text) }))
-    .filter(c => c.score > 0.38)
-    .sort((a, b) => b.score - a.score);
-
-  if (pageWideCandidates.length) {
-    console.log('  → Page-wide candidates:');
-    pageWideCandidates.slice(0, 5).forEach(c => console.log(`     - ${c.text} (${c.score.toFixed(2)})`));
-    bestOverall = [...bestOverall, ...pageWideCandidates.slice(0, 5)];
-    const best = pageWideCandidates[0];
-    const second = pageWideCandidates[1];
-    if (best.score >= AUTO_MATCH_THRESHOLD && (!second || best.score - second.score >= 0.08)) {
-      return { handle: best.handle, debug: pageWideCandidates.slice(0, 5).map(c => `${c.text} (${c.score.toFixed(2)})`) };
-    }
-  }
-
-  const dedup = [];
-  const seen = new Set();
-  for (const c of bestOverall.sort((a, b) => b.score - a.score)) {
-    const key = c.text;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    dedup.push(c);
-  }
-
-  return { handle: null, debug: dedup.slice(0, 5).map(c => `${c.text} (${c.score.toFixed(2)})`) };
+async function screenshot(page, tag) {
+  const f = path.join(ARTIFACTS_DIR, `${Date.now()}-${tag}.png`);
+  await page.screenshot({ path: f, fullPage: false }).catch(() => {});
+  return f;
 }
 
+// ── Main order flow ──────────────────────────────────────────────────────────
 async function placeOrder(order) {
-  console.log(`\n🍔 New order detected!`);
-  console.log(`   Restaurant: ${order.restaurant}`);
-  console.log(`   Item: ${order.item}`);
-  console.log(`   Address: ${order.address}`);
+  console.log(`\n🍔 New order!`);
+  console.log(`   Restaurant: ${order.restaurant} | Item: ${order.item}`);
 
-  const restaurantName = detectRestaurant(order.restaurant);
-  console.log(`   Mapped to: ${restaurantName}`);
+  const restaurant = detectRestaurant(order.restaurant) || detectRestaurant(order.item);
+  if (!restaurant) {
+    console.error('❌ Could not identify restaurant');
+    await notifyDiscord(order, false, 'Could not identify restaurant');
+    return;
+  }
+  console.log(`   Mapped to: ${restaurant.name} (store ${restaurant.storeId || 'unknown'})`);
 
   const browser = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
@@ -267,201 +129,179 @@ async function placeOrder(order) {
     args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--start-maximized'],
   });
   const page = browser.pages()[0] || await browser.newPage();
-  // Mask webdriver detection
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  }).catch(() => {});
+  await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); }).catch(() => {});
 
   try {
+    // ── Step 1: Open DoorDash and ensure login ────────────────────────────────
     console.log('  → Opening DoorDash...');
-    await page.goto('https://www.doordash.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto('https://www.doordash.com', { waitUntil: 'load', timeout: 30000 });
     await page.waitForTimeout(2000);
-
-    const currentUrl = page.url();
-    const looksLoggedOut = currentUrl.includes('/login') || currentUrl.includes('/consumer/login');
-    if (looksLoggedOut) {
-      console.log('  → DoorDash still wants login; trying once with saved credentials...');
-      await page.goto('https://www.doordash.com/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(2000);
-      const emailInput = await page.$('input[name="email"], input[type="email"], input[autocomplete="email"]');
-      const passwordInput = await page.$('input[name="password"], input[type="password"], input[autocomplete="current-password"]');
-      if (!emailInput || !passwordInput) throw new Error('DoorDash login fields not found.');
-      await emailInput.fill(DD_EMAIL);
-      await passwordInput.fill(DD_PASSWORD);
-      const submitBtn = await page.$('button[type="submit"], button:has-text("Sign In"), button:has-text("Continue")');
-      if (!submitBtn) throw new Error('Could not find DoorDash login submit button.');
-      await submitBtn.click();
+    if (page.url().includes('/login')) {
+      console.log('  → Logging in...');
+      await page.fill('input[name="email"], input[type="email"]', DD_EMAIL);
+      await page.fill('input[name="password"], input[type="password"]', DD_PASSWORD);
+      await page.click('button[type="submit"]');
       await page.waitForTimeout(4000);
-      console.log('  → Login submitted');
     } else {
-      console.log('  → Reusing saved DoorDash session');
+      console.log('  → Session active');
     }
 
-    console.log(`  → Searching for ${restaurantName}...`);
-    await page.goto(`https://www.doordash.com/search/store/${encodeURIComponent(restaurantName)}`, {
-      waitUntil: 'domcontentloaded', timeout: 30000
-    });
-    await page.waitForTimeout(2000);
+    // ── Step 2: Navigate to store and capture menu API ────────────────────────
+    const storeId = restaurant.storeId;
+    if (!storeId) throw new Error(`No storeId configured for ${restaurant.name} — need to add it`);
 
-    const storeLink = await page.$('a[data-anchor-id="StoreCard"], [data-anchor-id="StoreListItem"] a[href*="/store/"], a[href*="/store/"]');
-    if (!storeLink) throw new Error(`Could not find ${restaurantName} in search results`);
-    const href = await storeLink.getAttribute('href');
-    if (!href) throw new Error(`Found ${restaurantName} result but could not read its link`);
-    // Strip cursor/junk params — stale cursor causes DoorDash to not load menu
-    const rawUrl = href.startsWith('http') ? href : `https://www.doordash.com${href}`;
-    let storeUrl;
-    try {
-      const u = new URL(rawUrl);
-      u.searchParams.delete('cursor');
-      u.searchParams.delete('pi');
-      // Keep pickup=false so it stays in delivery mode
-      storeUrl = u.toString();
-    } catch {
-      storeUrl = rawUrl;
-    }
-
-    // Log all menu/store API responses so we can see if data is fetching
-    page.on('response', resp => {
-      const url = resp.url();
-      if (/store|menu|item/i.test(url) && !/analytics|segment|sentry|cdn|image|font/i.test(url)) {
-        console.log(`  → API ${resp.status()} ${url.substring(0, 120)}`);
-      }
+    // Intercept storepageFeed to get all menu items with IDs
+    const menuItemsPromise = new Promise((resolve) => {
+      const items = [];
+      const handler = async (resp) => {
+        if (resp.url().includes('storepageFeed') && resp.status() === 200) {
+          try {
+            const body = await resp.text();
+            const regex = /"id":"(\d+)","name":"([^"]+)"/g;
+            const seen = new Set();
+            let m;
+            while ((m = regex.exec(body)) !== null) {
+              if (!seen.has(m[1]) && +m[1] > 100000) {
+                seen.add(m[1]);
+                items.push({ id: m[1], name: m[2] });
+              }
+            }
+          } catch {}
+          page.off('response', handler);
+          resolve(items);
+        }
+      };
+      page.on('response', handler);
+      setTimeout(() => { page.off('response', handler); resolve(items); }, 15000);
     });
 
-    console.log(`  → Opening store: ${storeUrl}`);
-    await page.goto(storeUrl, { waitUntil: 'load', timeout: 60000 });
-
-    // Wait for networkidle briefly
+    console.log(`  → Loading store ${storeId}...`);
+    await page.goto(`https://www.doordash.com/store/${storeId}/`, { waitUntil: 'load', timeout: 60000 });
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1500);
 
-    // Scroll to trigger intersection-observer lazy sections
-    console.log('  → Scrolling to trigger lazy content...');
-    for (let i = 0; i < 10; i++) {
-      await page.mouse.wheel(0, 900).catch(() => {});
-      await page.waitForTimeout(500);
-    }
-    await page.mouse.wheel(0, -99999).catch(() => {});
-    await page.waitForTimeout(1000);
+    const menuItems = await menuItemsPromise;
+    console.log(`  → Menu loaded: ${menuItems.length} items`);
+    if (!menuItems.length) throw new Error('No menu items captured from API');
 
-    // Wait for visible menu content — DoorDash uses no data-anchor-id on menu items
-    // Items appear as span/div/p text nodes inside clickable containers
-    const menuSelectors = [
-      'span:has-text("Big Mac")',
-      'span:has-text("Extra Value Meals")',
-      'span:has-text("Burgers")',
-      'span:has-text("Chicken")',
-      'div:has-text("Add to Cart")',
-      'button:has-text("Add")',
-    ];
-    let foundMenuSelector = null;
-    for (const sel of menuSelectors) {
-      try {
-        await page.locator(sel).first().waitFor({ state: 'visible', timeout: 3000 });
-        foundMenuSelector = sel;
-        console.log(`  → Menu visible via: ${sel}`);
-        break;
-      } catch {}
-    }
-    if (!foundMenuSelector) console.log('  ⚠️  No menu selector matched, doing broad text scan');
+    // ── Step 3: Find best matching item ──────────────────────────────────────
+    console.log(`  → Finding: "${order.item}"`);
+    const match = bestMatch(order.item, menuItems);
 
-    // Quick text sample
-    const pageText = await page.evaluate(() => document.body.innerText.substring(0, 600));
-    const textSample = pageText.replace(/\s+/g, ' ').substring(0, 250);
-    console.log(`  → Page text: ${textSample}`);
-
-    console.log(`  → Looking for item: ${order.item}`);
-    const match = await findMenuItem(page, restaurantName, order.item);
-    if (!match.handle) {
-      const screenshot = await takeScreenshot(page, 'item-not-found');
-      throw new Error(`Could not confidently find item "${order.item}" on menu. Screenshot: ${screenshot}${match.debug.length ? ` | Candidates: ${match.debug.join('; ')}` : ''}`);
+    if (!match) {
+      const top5 = menuItems
+        .map(i => ({ ...i, score: score(order.item, i.name) }))
+        .filter(c => c.score > 0.3)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5);
+      const dbg = top5.map(c => `${c.name} (${c.score.toFixed(2)})`).join('; ');
+      await screenshot(page, 'item-not-found');
+      throw new Error(`Could not confidently match "${order.item}". Top candidates: ${dbg || 'none found'}`);
     }
 
-    await match.handle.click();
+    console.log(`  → Matched: "${match.name}" (${match.score.toFixed(2)}) — id ${match.id}`);
+
+    // ── Step 4: Navigate to item page by ID ──────────────────────────────────
+    const itemUrl = `https://www.doordash.com/store/${storeId}/item/${match.id}/`;
+    console.log(`  → Opening item: ${itemUrl}`);
+    await page.goto(itemUrl, { waitUntil: 'load', timeout: 30000 });
+    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
     await page.waitForTimeout(2000);
-    console.log('  → Item selected');
 
-    const requiredGroups = await page.$$('[data-anchor-id="ItemCustomizationSection"], [data-testid*="customization"], fieldset');
+    // ── Step 5: Handle modifiers ─────────────────────────────────────────────
+    const modalText = await page.evaluate(() => document.body.innerText.substring(0, 200));
+    console.log(`  → Item page: ${modalText.replace(/\s+/g, ' ').substring(0, 100)}`);
+
+    // Accept required options (pick first available for each required group)
+    const requiredGroups = await page.$$('fieldset, [role="group"]');
     for (const group of requiredGroups.slice(0, 8)) {
-      const firstOption = await group.$('input[type="radio"], input[type="checkbox"], button[role="radio"], button[role="checkbox"]');
-      if (firstOption) {
-        await firstOption.click().catch(() => {});
-        await page.waitForTimeout(250);
+      const radio = await group.$('input[type="radio"], button[role="radio"]');
+      if (radio) { await radio.click().catch(() => {}); await page.waitForTimeout(200); }
+    }
+
+    // ── Step 6: Add to cart ───────────────────────────────────────────────────
+    const addBtns = [
+      'button:has-text("Add to Order")',
+      'button:has-text("Add to Cart")',
+      'button:has-text("Add to cart")',
+      '[data-anchor-id="AddToOrderButton"]',
+    ];
+    let added = false;
+    for (const sel of addBtns) {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        added = true;
+        console.log('  → Added to cart');
+        break;
       }
     }
-
-    const addToCart = await page.$('[data-anchor-id="AddToOrderButton"], button:has-text("Add to Order"), button:has-text("Add to cart"), button:has-text("Add to Cart")');
-    if (!addToCart) {
-      const screenshot = await takeScreenshot(page, 'missing-add-to-cart');
-      throw new Error(`Could not find Add to Cart button. Screenshot: ${screenshot}`);
+    if (!added) {
+      await screenshot(page, 'no-add-btn');
+      throw new Error('Could not find Add to Cart button');
     }
-    await addToCart.click();
     await page.waitForTimeout(2500);
-    console.log('  → Added to cart');
 
-    const checkout = await page.$('[data-anchor-id="CheckoutButton"], button:has-text("Go to Checkout"), a:has-text("Checkout")');
-    if (checkout) {
-      await checkout.click().catch(() => {});
-      await page.waitForTimeout(3000);
-      console.log('  → At checkout');
+    // ── Step 7: Checkout ──────────────────────────────────────────────────────
+    const checkoutBtns = [
+      '[data-anchor-id="CheckoutButton"]',
+      'button:has-text("Go to Checkout")',
+      'a:has-text("Checkout")',
+      'button:has-text("Checkout")',
+    ];
+    for (const sel of checkoutBtns) {
+      const btn = await page.$(sel);
+      if (btn) { await btn.click().catch(() => {}); break; }
     }
+    await page.waitForTimeout(3000);
 
-    const preSubmitShot = await takeScreenshot(page, 'pre-submit');
-    const placeOrderBtn = await page.$('[data-anchor-id="PlaceOrderButton"], button:has-text("Place Order")');
-    if (!placeOrderBtn) {
-      throw new Error(`Could not find Place Order button — manual review needed. Screenshot: ${preSubmitShot}`);
+    // ── Step 8: Place order ───────────────────────────────────────────────────
+    await screenshot(page, 'pre-submit');
+    const placeOrderBtns = [
+      '[data-anchor-id="PlaceOrderButton"]',
+      'button:has-text("Place Order")',
+      'button:has-text("Place order")',
+    ];
+    let placed = false;
+    for (const sel of placeOrderBtns) {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        placed = true;
+        console.log('  → Order submitted!');
+        break;
+      }
     }
+    if (!placed) throw new Error('Could not find Place Order button');
 
-    console.log('  → Placing order...');
-    await placeOrderBtn.click();
     await page.waitForTimeout(5000);
-
-    const confirmation = await page.$('[data-anchor-id="OrderConfirmation"], text=Your order has been placed, text=Order Confirmed');
-    if (confirmation) {
-      const confirmShot = await takeScreenshot(page, 'order-confirmed');
-      console.log('  ✅ Order placed successfully!');
-      await notifyDiscord(order, true, `Confirmation screenshot: ${confirmShot}`);
+    const confirmed = await page.$('text=Your order has been placed, text=Order Confirmed, text=order is on its way').catch(() => null);
+    if (confirmed) {
+      await screenshot(page, 'confirmed');
+      console.log('  ✅ Order confirmed!');
+      await notifyDiscord(order, true);
     } else {
-      const screenshot = await takeScreenshot(page, 'submit-unknown');
-      console.log('  ⚠️  Could not confirm order placed — check browser window');
-      await notifyDiscord(order, false, `Submit outcome unknown. Screenshot: ${screenshot}`);
+      await screenshot(page, 'submit-unknown');
+      console.log('  ⚠️  Submit outcome unknown — check browser');
+      await notifyDiscord(order, false, 'Submit outcome unknown — check browser');
     }
   } catch (err) {
-    console.error(`  ❌ Error placing order: ${err.message}`);
+    console.error(`  ❌ ${err.message}`);
     await notifyDiscord(order, false, err.message);
   }
 
+  // Keep browser open 5 min for review then close
   setTimeout(() => browser.close(), 5 * 60 * 1000);
 }
 
-async function notifyDiscord(order, success, error) {
-  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
-  if (!webhookUrl) return;
-  const content = success
-    ? `✅ **DoorDash order placed!**\n🏪 ${order.restaurant}\n🍔 ${order.item}\n📍 ${order.address}\n${error || ''}`
-    : `⚠️ **Order automation failed**\n🏪 ${order.restaurant}\n🍔 ${order.item}\n${error ? `❌ ${error}` : ''}`;
-  try {
-    await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content })
-    });
-  } catch (err) {
-    console.error('Discord notify error:', err.message);
-  }
-}
-
+// ── Polling loop ─────────────────────────────────────────────────────────────
 async function main() {
   console.log('🚀 DD-Dad Launcher started');
-  console.log(`   Polling Railway every ${POLL_INTERVAL_MS / 1000}s...`);
+  console.log(`   Polling every ${POLL_INTERVAL_MS / 1000}s...`);
   while (true) {
     const order = await checkForOrder();
     if (order) await placeOrder(order);
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
   }
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+main().catch(err => { console.error('Fatal:', err); process.exit(1); });
